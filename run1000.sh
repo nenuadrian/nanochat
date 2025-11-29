@@ -5,6 +5,11 @@
 # A bit sparser on comments, see speedrun.sh for more detail
 
 # all the setup stuff
+export CC=gcc
+export CXX=g++
+export TORCHINDUCTOR_CPP_CXX=g++
+
+
 export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 mkdir -p $NANOCHAT_BASE_DIR
@@ -72,7 +77,7 @@ python -m scripts.tok_eval
 # 5) That's it, everything else (e.g. the learning rates) is adjusted automatically by the training script.
 
 # Number of processes/GPUs to use
-NPROC_PER_NODE=8
+NPROC_PER_NODE=$(nvidia-smi -L | wc -l)
 
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=32 --device_batch_size=8 --run=$WANDB_RUN
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss
