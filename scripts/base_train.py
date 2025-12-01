@@ -80,9 +80,7 @@ core_metric_every = (
 )
 core_metric_max_per_task = 500  # examples per task in estimating the core metric
 sample_every = 2000  # every how many steps to sample from the model
-save_every = (
-    -1
-)  # every how many steps to save model checkpoints (-1 = disable, and save only at the end of the run)
+save_every = 250  # every how many steps to save model checkpoints (-1 = disable, and save only at the end of the run)
 # Output
 model_tag = (
     ""  # optionally override the model tag for the output checkpoint directory name
