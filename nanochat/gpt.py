@@ -150,19 +150,10 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
-        self.layer_idx = layer_idx
 
     def forward(self, x, cos_sin, kv_cache):
-        if self.training and self.layer_idx > 0:  # Skip first layer
-            x = x + torch.utils.checkpoint.checkpoint(
-                self.attn, norm(x), cos_sin, kv_cache, use_reentrant=False
-            )
-            x = x + torch.utils.checkpoint.checkpoint(
-                self.mlp, norm(x), use_reentrant=False
-            )
-        else:
-            x = x + self.attn(norm(x), cos_sin, kv_cache)
-            x = x + self.mlp(norm(x))
+        x = x + self.attn(norm(x), cos_sin, kv_cache)
+        x = x + self.mlp(norm(x))
         return x
 
 
