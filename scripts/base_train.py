@@ -192,7 +192,7 @@ if resuming:
 
 orig_model = model  # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
 model = torch.compile(
-    model, dynamic=False, mode="max-autotune"
+    model, dynamic=False
 )  # the inputs to model will never change shape so dynamic=False is safe
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
