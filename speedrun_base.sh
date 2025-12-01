@@ -41,7 +41,7 @@ source .venv/bin/activate
 #    `WANDB_RUN=d26 bash speedrun.sh`
 if [ -z "$WANDB_RUN" ]; then
     # by default use "dummy" : it's handled as a special case, skips logging to wandb
-    WANDB_RUN=dummy
+    WANDB_RUN=speedrun
 fi
 
 # -----------------------------------------------------------------------------
@@ -69,7 +69,7 @@ source "$HOME/.cargo/env"
 NPROC_PER_NODE=$(nvidia-smi -L | wc -l)
 
 # pretrain the d20 model
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --run=$WANDB_RUN --resume_from_step=100
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --run=$WANDB_RUN --resume_from_step=500
 # evaluate the model on a larger chunk of train/val data and draw some samples
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss
 # evaluate the model on CORE tasks
