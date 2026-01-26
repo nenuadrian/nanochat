@@ -51,7 +51,7 @@ torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -
 # run reinforcement learning
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_mpo -- --run=$WANDB_RUN --algo=mpo
 # eval the RL model only on GSM8K
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i rl -a GSM8K
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i mpo -a GSM8K
 
 # -----------------------------------------------------------------------------
 # Generate the full report by putting together all the sections
