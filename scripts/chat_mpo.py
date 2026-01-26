@@ -501,7 +501,7 @@ for step in range(num_steps):
         output_dirname = (
             args.model_tag if args.model_tag else f"d{depth}"
         )  # base the model tag on the depth of the base model
-        checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", output_dirname)
+        checkpoint_dir = os.path.join(base_dir, "chatmpo_checkpoints", output_dirname)
         model_config_kwargs = (
             model.config.__dict__
         )  # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer

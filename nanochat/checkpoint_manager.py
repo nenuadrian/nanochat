@@ -167,6 +167,7 @@ def load_model(source, *args, **kwargs):
         "mid": "mid_checkpoints",
         "sft": "chatsft_checkpoints",
         "rl": "chatrl_checkpoints",
+        "mpo": "chatmpo_checkpoints",
     }[source]
     base_dir = get_base_dir()
     checkpoints_dir = os.path.join(base_dir, model_dir)
