@@ -43,13 +43,13 @@ fi
 # Number of processes/GPUs to use
 NPROC_PER_NODE=1
 
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i sft
+# torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i sft --model-tag d10
 
 # -----------------------------------------------------------------------------
 # Reinforcement Learning. Optional, and currently only on GSM8K
 
 # run reinforcement learning
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_mpo -- --run=$WANDB_RUN --algo=mpo
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_vmpo -- --run=$WANDB_RUN --model-tag d10
 # eval the RL model only on GSM8K
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i mpo -a GSM8K
 

@@ -1,21 +1,11 @@
 """
-Reinforcement learning on GSM8K via "GRPO".
-
-I put GRPO in quotes because we actually end up with something a lot
-simpler and more similar to just REINFORCE:
-
-1) Delete trust region, so there is no KL regularization to a reference model
-2) We are on policy, so there's no need for PPO ratio+clip.
-3) We use DAPO style normalization that is token-level, not sequence-level.
-4) Instead of z-score normalization (r - mu)/sigma, only use (r - mu) as the advantage.
+Reinforcement learning on GSM8K via VMPO
 
 1 GPU:
-python -m scripts.chat_mpo -- --algo=mpo
+python -m scripts.chat_vmpo -- --run=default
 
 8 GPUs:
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_mpo -- --run=default
-
-Supports MPO/VMPO via --algo.
+torchrun --standalone --nproc_per_node=8 -m scripts.chat_vmpo -- --run=default
 """
 
 import argparse
@@ -25,6 +15,8 @@ import wandb
 import torch
 import torch.distributed as dist
 from contextlib import nullcontext
+import copy
+import math
 
 from nanochat.common import (
     compute_init,
@@ -118,17 +110,62 @@ parser.add_argument(
 parser.add_argument(
     "--init-lr-frac", type=float, default=0.05, help="initial LR as fraction of base LR"
 )
+# Advantage normalization (per-prompt, across the N samples for that prompt)
+parser.add_argument(
+    "--adv-norm",
+    type=str,
+    default="zscore",
+    choices=["none", "zscore", "mad"],
+    help="per-prompt advantage normalization across samples (recommended for VMPO E-step)",
+)
+parser.add_argument(
+    "--adv-eps",
+    type=float,
+    default=1e-6,
+    help="epsilon for advantage normalization",
+)
+parser.add_argument(
+    "--adv-clip",
+    type=float,
+    default=10.0,
+    help="clip normalized advantages to [-adv_clip, adv_clip] (0 disables)",
+)
 # MPO/VMPO
 parser.add_argument(
-    "--algo",
-    type=str,
-    default="mpo",
-    choices=["mpo", "vmpo"],
-    help="optimization algorithm",
-)
-parser.add_argument("--mpo-eta", type=float, default=1.0, help="MPO temperature (eta)")
-parser.add_argument(
     "--vmpo-eps", type=float, default=0.5, help="VMPO top-fraction for weighting"
+)
+parser.add_argument(
+    "--q-kl-eps",
+    type=float,
+    default=0.1,
+    help="E-step constraint: KL(q || Unif(topK)) <= q_kl_eps (sample-based proxy)",
+)
+parser.add_argument(
+    "--eta-min", type=float, default=1e-4, help="min eta for E-step binary search"
+)
+parser.add_argument(
+    "--eta-max", type=float, default=1e3, help="max eta for E-step binary search"
+)
+parser.add_argument(
+    "--eta-search-iters",
+    type=int,
+    default=32,
+    help="binary search iterations for E-step eta solve",
+)
+parser.add_argument(
+    "--kl-target", type=float, default=0.02, help="target KL to reference"
+)
+parser.add_argument(
+    "--entropy-target", type=float, default=2.0, help="target entropy proxy"
+)
+parser.add_argument(
+    "--dual-lr", type=float, default=0.01, help="dual variable update rate"
+)
+parser.add_argument(
+    "--ref-update-every",
+    type=int,
+    default=50,
+    help="update reference model every N steps (0 = never)",
 )
 # Evaluation / checkpointing
 parser.add_argument(
@@ -142,6 +179,11 @@ parser.add_argument(
 )
 parser.add_argument(
     "--save-every", type=int, default=60, help="save checkpoint every N steps"
+)
+parser.add_argument(
+    "--completion-norm",
+    action="store_true",
+    help="normalize sequence logprobs by completion length (per-token objective/KL)",
 )
 args = parser.parse_args()
 user_config = vars(args).copy()
@@ -171,6 +213,9 @@ model, tokenizer, meta = load_model(
     args.source, device, phase="eval", model_tag=args.model_tag, step=args.model_step
 )
 engine = Engine(model, tokenizer)  # for sampling rollouts
+ref_model = copy.deepcopy(model).eval()
+for p in ref_model.parameters():
+    p.requires_grad_(False)
 
 # -----------------------------------------------------------------------------
 # Rollout / sampling generator loop that yields batches of examples for training
@@ -183,9 +228,7 @@ print0(f"Calculated number of steps: {num_steps}")
 
 @torch.no_grad()
 def get_batch():
-    assistant_end = tokenizer.encode_special(
-        "<|assistant_end|>"
-    )  # ok to use this token, it's only for padding and isn't used in the loss.
+    assistant_end = tokenizer.encode_special("<|assistant_end|>")
     rank_indices = range(
         ddp_rank, len(train_task), ddp_world_size
     )  # each rank is responsible for different examples in the training data
@@ -254,20 +297,44 @@ def get_batch():
         # NOTE also that the Engine returns mask=0 for BOTH the prompt tokens AND the tool use tokens.
         # So we will (correctly) end up not training on the prompt tokens, or the tool use forced tokens.
         rewards = torch.tensor(rewards, dtype=torch.float, device=device)
-        # Calculate the advantages by simply subtracting the mean (instead of z-score (x-mu)/sigma)
-        mu = rewards.mean()
-        advantages = rewards - mu
-        # Compute MPO/VMPO weights per sample
-        if args.algo == "mpo":
-            eta = max(args.mpo_eta, 1e-6)
-            weights = torch.softmax(advantages / eta, dim=0)
-        else:
-            k = max(1, int(args.vmpo_eps * advantages.numel()))
-            topk = torch.topk(advantages, k=k, largest=True).indices
-            weights = torch.zeros_like(advantages)
-            weights[topk] = 1.0 / k
-        # yield inputs/targets as (B, T) of ids and rewards as (B,) of floats
-        yield generated_token_sequences, inputs, targets, rewards, advantages, weights
+
+        # Baseline + advantage normalization (per prompt, across samples)
+        advantages = rewards - rewards.mean()
+
+        if args.adv_norm != "none":
+            adv = advantages.float()
+            if args.adv_norm == "zscore":
+                scale = adv.std(unbiased=False).clamp_min(args.adv_eps)
+                adv = (adv - adv.mean()) / scale
+            elif args.adv_norm == "mad":
+                med = adv.median()
+                mad = (adv - med).abs().median().clamp_min(args.adv_eps)
+                adv = (adv - med) / mad
+            if args.adv_clip and args.adv_clip > 0:
+                adv = adv.clamp(min=-args.adv_clip, max=args.adv_clip)
+            advantages = adv.to(dtype=rewards.dtype)
+
+        # VMPO E-step: temperature-controlled soft weights on top-fraction
+        weights, e_step_eta, q_kl = _vmpo_e_step_q_from_advantages(
+            advantages=advantages,
+            top_frac=args.vmpo_eps,
+            kl_eps=args.q_kl_eps,
+            eta_min=args.eta_min,
+            eta_max=args.eta_max,
+            iters=args.eta_search_iters,
+        )
+        weights = weights.to(dtype=rewards.dtype)
+
+        yield (
+            generated_token_sequences,
+            inputs,
+            targets,
+            rewards,
+            advantages,
+            weights,
+            e_step_eta.to(dtype=rewards.dtype),
+            q_kl.to(dtype=rewards.dtype),
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -359,8 +426,15 @@ print0(f"Calculated examples per rank: {examples_per_rank}")
 
 # Kick off the training loop
 batch_iterator = get_batch()
-for step in range(num_steps):
 
+# Dual variables for constraints in the M-step (keep semantics: these are NOT E-step eta)
+log_kl_coef = torch.tensor(0.0, device=device, requires_grad=True)
+log_ent_coef = torch.tensor(0.0, device=device, requires_grad=True)
+dual_optimizer = torch.optim.Adam([log_kl_coef, log_ent_coef], lr=args.dual_lr)
+
+for step in range(num_steps):
+    if args.ref_update_every > 0 and step % args.ref_update_every == 0:
+        ref_model.load_state_dict(model.state_dict())
     # Evaluate the model once in a while and log to wandb
     if step % args.eval_every == 0:
         model.eval()
@@ -405,8 +479,12 @@ for step in range(num_steps):
     # Forward/Backward on rollouts over multiple examples in the dataset
     rewards_list = []
     sequence_lengths = []
+    e_step_eta_list = []
+    q_kl_list = []
+    kl_sum = torch.zeros((), device=device)
+    entropy_sum = torch.zeros((), device=device)
+    kl_count = 0
     for example_step in range(examples_per_rank):
-        # Get one batch corresponding to one example in the training dataset
         (
             sequences_all,
             inputs_all,
@@ -414,7 +492,13 @@ for step in range(num_steps):
             rewards_all,
             advantages_all,
             weights_all,
+            e_step_eta,
+            q_kl,
         ) = next(batch_iterator)
+
+        e_step_eta_list.append(float(e_step_eta.item()))
+        q_kl_list.append(float(q_kl.item()))
+
         # Evaluate the loss and gradients
         model.train()  # ensure the model is in train mode
         # We need one more loop because we can never exceed the device_batch_size
@@ -431,22 +515,69 @@ for step in range(num_steps):
             rewards = rewards_all[b0:b1]
             advantages = advantages_all[b0:b1]
             weights = weights_all[b0:b1]
-            # Calculate log probabilities. Note that the loss calculates NLL = -logp, so we negate
+            # Calculate log probabilities and token-level entropy from logits
             with autocast_ctx:
-                logp = -model(inputs, targets, loss_reduction="none").view_as(
-                    inputs
-                )  # (B, T)
+                logits = model(inputs)
+                log_probs = torch.log_softmax(logits, dim=-1)
+                safe_targets = targets.clamp(min=0)
+                token_logp = log_probs.gather(
+                    dim=-1, index=safe_targets.unsqueeze(-1)
+                ).squeeze(-1)
+            with torch.no_grad():
+                logits_ref = ref_model(inputs)
+                log_probs_ref = torch.log_softmax(logits_ref, dim=-1)
+                token_logp_ref = log_probs_ref.gather(
+                    dim=-1, index=safe_targets.unsqueeze(-1)
+                ).squeeze(-1)
             # MPO/VMPO objective (sequence-level, length-normalized)
             valid_mask = targets >= 0
-            seq_logp = (logp * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp(
+            seq_logp_sum = (token_logp * valid_mask).sum(dim=1)
+            seq_logp_ref_sum = (token_logp_ref * valid_mask).sum(dim=1)
+            completion_len = valid_mask.sum(dim=1).clamp(min=1)
+
+            seq_logp_mean = seq_logp_sum / completion_len
+            seq_logp_ref_mean = seq_logp_ref_sum / completion_len
+
+            if args.completion_norm:
+                kl_est = (seq_logp_mean - seq_logp_ref_mean).mean()
+                pg_term = seq_logp_mean
+            else:
+                kl_est = (seq_logp_sum - seq_logp_ref_sum).mean()
+                pg_term = seq_logp_sum
+
+            token_entropy = -(log_probs.exp() * log_probs).sum(dim=-1)
+            entropy_est = (token_entropy * valid_mask).sum() / valid_mask.sum().clamp(
                 min=1
             )
-            pg_obj = (weights * seq_logp).sum()
+            pg_obj = (weights * pg_term).sum()
             # normalize by number of passes and examples_per_rank
             pg_obj = pg_obj / (num_passes * examples_per_rank)
-            # Finally, formulate the loss that we want to minimize (instead of objective we wish to maximize)
-            loss = -pg_obj
+
+            # Dual variables (positive via exp)
+            kl_coef = log_kl_coef.exp().detach().clamp(min=1e-6, max=1e6)
+            ent_coef = log_ent_coef.exp().detach().clamp(min=1e-6, max=1e6)
+
+            # Loss with constraints
+            loss = (
+                -pg_obj
+                + kl_coef * (kl_est - args.kl_target)
+                + ent_coef * (args.entropy_target - entropy_est)
+            )
             loss.backward()
+
+            # Dual update (projected via exp)
+            dual_optimizer.zero_grad(set_to_none=True)
+            kl_coef = log_kl_coef.exp().clamp(min=1e-6, max=1e6)
+            ent_coef = log_ent_coef.exp().clamp(min=1e-6, max=1e6)
+            dual_obj = kl_coef * (kl_est.detach() - args.kl_target) + ent_coef * (
+                args.entropy_target - entropy_est.detach()
+            )
+            (-dual_obj).backward()
+            dual_optimizer.step()
+
+            kl_sum = kl_sum + kl_est.detach()
+            entropy_sum = entropy_sum + entropy_est.detach()
+            kl_count += 1
             print0(
                 f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss: {loss.item():.6f} | Average reward: {rewards.mean().item()}"
             )
@@ -457,23 +588,41 @@ for step in range(num_steps):
     # A bunch of logging for how the rollouts went this step
     mean_reward = sum(rewards_list) / len(rewards_list)
     mean_sequence_length = sum(sequence_lengths) / len(sequence_lengths)
+
+    mean_e_step_eta = sum(e_step_eta_list) / max(len(e_step_eta_list), 1)
+    mean_q_kl = sum(q_kl_list) / max(len(q_kl_list), 1)
+
     if ddp:  # aggregate across ranks
         mean_reward_tensor = torch.tensor(mean_reward, dtype=torch.float, device=device)
         mean_sequence_length_tensor = torch.tensor(
             mean_sequence_length, dtype=torch.float, device=device
         )
+        mean_e_step_eta_tensor = torch.tensor(
+            mean_e_step_eta, dtype=torch.float, device=device
+        )
+        mean_q_kl_tensor = torch.tensor(mean_q_kl, dtype=torch.float, device=device)
+
         dist.all_reduce(mean_reward_tensor, op=dist.ReduceOp.AVG)
         dist.all_reduce(mean_sequence_length_tensor, op=dist.ReduceOp.AVG)
+        dist.all_reduce(mean_e_step_eta_tensor, op=dist.ReduceOp.AVG)
+        dist.all_reduce(mean_q_kl_tensor, op=dist.ReduceOp.AVG)
+
         mean_reward = mean_reward_tensor.item()
         mean_sequence_length = mean_sequence_length_tensor.item()
-    print0(
-        f"Step {step}/{num_steps} | Average reward: {mean_reward} | Average sequence length: {mean_sequence_length:.2f}"
-    )
+        mean_e_step_eta = mean_e_step_eta_tensor.item()
+        mean_q_kl = mean_q_kl_tensor.item()
+
     wandb_run.log(
         {
             "step": step,
             "reward": mean_reward,
             "sequence_length": mean_sequence_length,
+            "kl_est": (kl_sum / max(kl_count, 1)).item(),
+            "entropy_est": (entropy_sum / max(kl_count, 1)).item(),
+            "e_step_eta": mean_e_step_eta,
+            "q_kl": mean_q_kl,
+            "kl_coef": log_kl_coef.exp().item(),
+            "ent_coef": log_ent_coef.exp().item(),
         }
     )
 
