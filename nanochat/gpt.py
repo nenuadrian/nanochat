@@ -364,15 +364,34 @@ class GPT(nn.Module):
 
     def num_scaling_params(self):
         """
-        Return all of the parameters, same as Chinchilla paper.
-        Kaplan et al. did not include embedding parameters and said that this led to cleaner scaling laws.
-        But Kaplan et al. also had a bug in their results (as pointed out by Chinchilla).
-        My own experiments in nanochat confirm the Chinchilla approach gives the much cleaner scaling law.
-        Ref: https://arxiv.org/abs/2203.15556 (Chinchilla paper <- good).
-        Ref: https://arxiv.org/abs/2001.08361 (Kaplan et al. original scaling laws paper <- bad)
+        Return detailed parameter counts for scaling law analysis.
+        Different papers use different conventions:
+        - Kaplan et al. excluded embedding parameters
+        - Chinchilla included all parameters
+        Ref: https://arxiv.org/abs/2203.15556 (Chinchilla paper)
+        Ref: https://arxiv.org/abs/2001.08361 (Kaplan et al. original scaling laws paper)
+
+        Returns a dict with counts for each parameter group, so downstream analysis
+        can experiment with which combination gives the cleanest scaling laws.
         """
-        nparams = sum(p.numel() for p in self.parameters())
-        return nparams
+        # Count each group separately (mirrors the grouping in setup_optimizers)
+        wte = sum(p.numel() for p in self.transformer.wte.parameters())
+        bigram_embed = sum(p.numel() for p in self.bigram_embed.parameters())
+        value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
+        lm_head = sum(p.numel() for p in self.lm_head.parameters())
+        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
+        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.bigram_lambdas.numel()
+        total = wte + bigram_embed + value_embeds + lm_head + transformer_matrices + scalars
+        assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
+        return {
+            'wte': wte,
+            'bigram_embed': bigram_embed,
+            'value_embeds': value_embeds,
+            'lm_head': lm_head,
+            'transformer_matrices': transformer_matrices,
+            'scalars': scalars,
+            'total': total,
+        }
 
     def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
