@@ -147,6 +147,7 @@ model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag
 engine = Engine(model, tokenizer)
 ref_model = model.__class__(model.config).to(device)
 ref_model.load_state_dict(model.state_dict())
+ref_model.to(device=device, dtype=ptdtype)
 ref_model.eval()
 for p in ref_model.parameters():
     p.requires_grad_(False)
@@ -366,7 +367,8 @@ for step in range(num_steps):
                 safe_targets = targets.clamp(min=0)
                 token_logp = log_probs.gather(dim=-1, index=safe_targets.unsqueeze(-1)).squeeze(-1)
             with torch.no_grad():
-                logits_ref = ref_model(inputs)
+                with autocast_ctx:
+                    logits_ref = ref_model(inputs)
                 log_probs_ref = torch.log_softmax(logits_ref, dim=-1)
                 token_logp_ref = log_probs_ref.gather(dim=-1, index=safe_targets.unsqueeze(-1)).squeeze(-1)
 
