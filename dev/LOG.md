@@ -4,6 +4,12 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-01-28: Reverted Bigram Hash Embeddings
+
+Removed bigram embeddings (engram-lite) from the codebase. At larger scale (d25), the improvement was tiny and disappeared entirely when measured by wall clock time. It also bloated the VRAM used. The extra parameters and complexity aren't justified.
+
+---
+
 ## 2026-01-27: Bigram Hash Embeddings (Engram-lite)
 
 Explored N-gram memory modules inspired by the [DeepSeek Engram paper](https://arxiv.org/abs/2601.07372) and [modded-nanogpt PR #201](https://github.com/KellerJordan/modded-nanogpt/pull/201).
