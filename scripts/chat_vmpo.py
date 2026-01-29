@@ -59,7 +59,7 @@ parser.add_argument("--num-epochs", type=int, default=1)
 parser.add_argument("--device-batch-size", type=int, default=8)
 parser.add_argument("--examples-per-step", type=int, default=16)
 parser.add_argument("--num-samples", type=int, default=16)
-parser.add_argument("--m-steps", type=int, default=3)
+parser.add_argument("--m-steps", type=int, default=1)
 
 # Generation
 parser.add_argument("--max-new-tokens", type=int, default=256)
