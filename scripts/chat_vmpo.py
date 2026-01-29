@@ -59,6 +59,7 @@ parser.add_argument("--num-epochs", type=int, default=1)
 parser.add_argument("--device-batch-size", type=int, default=8)
 parser.add_argument("--examples-per-step", type=int, default=16)
 parser.add_argument("--num-samples", type=int, default=16)
+parser.add_argument("--m-steps", type=int, default=3)
 
 # Generation
 parser.add_argument("--max-new-tokens", type=int, default=256)
@@ -228,11 +229,15 @@ for step in range(num_steps):
     logp_ref_all = []
     seq_mask_all = []
     seq_len_all = []
+    inputs_all = []
+    targets_all = []
 
     # Collect rollouts
     for _ in range(args.examples_per_step // world_size):
         inputs, targets, rewards = next(batch_iter)
         rewards_all.append(rewards)
+        inputs_all.append(inputs)
+        targets_all.append(targets)
 
         with autocast_ctx:
             logp = -model(inputs, targets, loss_reduction="none")
@@ -251,23 +256,39 @@ for step in range(num_steps):
         seq_mask_all.append(mask.any(dim=1))
         seq_len_all.append(mask.sum(dim=1).float())
 
-    rewards = torch.cat(rewards_all)
-    logp = torch.cat(logp_all)
-    logp_ref = torch.cat(logp_ref_all)
-    valid = torch.cat(seq_mask_all)
-    seq_lens = torch.cat(seq_len_all)
+    # Group by prompt to avoid cross-prompt leakage when centering
+    rewards = torch.stack(rewards_all)  # (num_prompts, num_samples)
+    logp = torch.stack(logp_all)
+    logp_ref = torch.stack(logp_ref_all)
+    valid = torch.stack(seq_mask_all)
+    seq_lens = torch.stack(seq_len_all)
 
     # Advantages
-    adv = rewards - rewards.mean()
+    adv = rewards - rewards.mean(dim=1, keepdim=True)  # per-prompt baseline
+    adv_flat = adv.flatten()
+    rewards_flat = rewards.flatten()
+    valid_mask = valid
+    valid = valid.flatten()
+    seq_lens = seq_lens.flatten()
 
     # -------------------------
     # E-step: optimize η
     # -------------------------
+    counts = valid_mask.float().sum(dim=1, keepdim=True)
+    adv_masked = adv.masked_fill(~valid_mask, float("-inf"))
+
     for _ in range(args.eta_steps):
         eta = torch.nn.functional.softplus(eta_raw) + args.eta_min
-        A = adv - adv.max()
-        log_mean_exp = torch.logsumexp(A / eta, dim=0) - math.log(len(A))
-        loss_eta = eta * (args.eps_eta + log_mean_exp)
+        adv_max = torch.where(
+            counts > 0,
+            adv_masked.max(dim=1, keepdim=True).values,
+            torch.zeros_like(counts),
+        )
+        adv_centered = adv_masked - adv_max
+        log_mean_exp = torch.logsumexp(adv_centered / eta, dim=1) - torch.log(
+            counts.clamp_min(1.0)
+        )
+        loss_eta = eta * (args.eps_eta + log_mean_exp.mean())
 
         eta_opt.zero_grad()
         loss_eta.backward()
@@ -275,36 +296,58 @@ for step in range(num_steps):
 
     with torch.no_grad():
         eta = torch.nn.functional.softplus(eta_raw) + args.eta_min
-        w = torch.exp((adv - adv.max()) / eta)
-        psi = w / w.sum().clamp_min(1e-8)
+        adv_max = torch.where(
+            counts > 0,
+            adv_masked.max(dim=1, keepdim=True).values,
+            torch.zeros_like(counts),
+        )
+        adv_centered = adv_masked - adv_max
+        w = torch.exp(adv_centered / eta) * valid_mask.float()
+        psi = w / w.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
     # -------------------------
     # M-step: policy + α
     # -------------------------
-    logp = logp[valid]
-    logp_ref = logp_ref[valid]
-    psi_v = psi[valid]
+    logp_ref_flat = logp_ref.flatten()
+    psi_flat = psi.flatten()
+    psi_valid = psi_flat[valid]
+    logp_ref_valid = logp_ref_flat[valid]
 
-    policy_loss = -(psi_v * logp).sum()
+    for m_step in range(args.m_steps):
+        # Recompute log probabilities with the current policy parameters
+        logp_curr = []
+        for inputs, targets in zip(inputs_all, targets_all):
+            with autocast_ctx:
+                logp_tokens = -model(inputs, targets, loss_reduction="none")
+                logp_tokens = logp_tokens.view_as(inputs)
+            mask = targets >= 0
+            logp_seq = (logp_tokens * mask).sum(dim=1)
+            logp_curr.append(logp_seq)
 
-    kl = logp_ref - logp
-    kl_mean = (psi_v * kl).sum()
+        logp = torch.stack(logp_curr)
+        logp_flat = logp.flatten()
+        logp_valid = logp_flat[valid]
 
-    alpha = torch.nn.functional.softplus(alpha_raw) + args.alpha_min
-    total_loss = policy_loss + alpha.detach() * kl_mean
+        policy_loss = -(psi_valid * logp_valid).sum() / rewards.shape[0]
 
-    total_loss.backward()
+        kl = logp_ref_valid - logp_valid
+        kl_mean = (psi_valid * kl).sum() / rewards.shape[0]
 
-    grad_norm = torch.nn.utils.clip_grad_norm_(
-        model.parameters(), max_norm=float("inf")
-    )
+        alpha = torch.nn.functional.softplus(alpha_raw) + args.alpha_min
+        total_loss = policy_loss + alpha.detach() * kl_mean
 
-    for opt in optimizers:
-        for g in opt.param_groups:
-            g["lr"] = g["initial_lr"] * lr_mult(step)
-        opt.step()
+        total_loss.backward()
 
-    model.zero_grad(set_to_none=True)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), max_norm=float("inf")
+        )
+
+        for opt in optimizers:
+            for g in opt.param_groups:
+                g["lr"] = g["initial_lr"] * lr_mult(step)
+            opt.step()
+
+        model.zero_grad(set_to_none=True)
 
     # α update
     alpha_opt.zero_grad()
@@ -314,29 +357,29 @@ for step in range(num_steps):
 
     # Logging
     if master:
-        psi_entropy = -(psi * psi.clamp_min(1e-8).log()).sum().item()
+        psi_entropy = -(psi * psi.clamp_min(1e-8).log()).sum(dim=1).mean().item()
         lr_values = []
         for opt in optimizers:
             lr_values.extend([g["lr"] for g in opt.param_groups])
         lr_mean = sum(lr_values) / len(lr_values) if lr_values else 0.0
         log_data = {
             "step": step,
-            "reward_mean": rewards.mean().item(),
-            "reward_std": rewards.std().item(),
-            "reward_max": rewards.max().item(),
-            "reward_min": rewards.min().item(),
+            "reward_mean": rewards_flat.mean().item(),
+            "reward_std": rewards_flat.std().item(),
+            "reward_max": rewards_flat.max().item(),
+            "reward_min": rewards_flat.min().item(),
             "valid_frac": valid.float().mean().item(),
             "seq_len_mean": seq_lens.mean().item(),
-            "adv_mean": adv.mean().item(),
-            "adv_std": adv.std().item(),
+            "adv_mean": adv_flat.mean().item(),
+            "adv_std": adv_flat.std().item(),
             "psi_entropy": psi_entropy,
             "eta": eta.item(),
             "alpha": alpha.item(),
             "kl": kl_mean.item(),
             "kl_max": kl.max().item(),
-            "logp_mean": logp.mean().item(),
-            "logp_std": logp.std().item(),
-            "logp_ref_mean": logp_ref.mean().item(),
+            "logp_mean": logp_valid.mean().item(),
+            "logp_std": logp_valid.std().item(),
+            "logp_ref_mean": logp_ref_valid.mean().item(),
             "loss_eta": loss_eta.item(),
             "loss_alpha": loss_alpha.item(),
             "grad_norm": (
