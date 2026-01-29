@@ -17,6 +17,7 @@ import os
 import itertools
 import math
 import copy
+import time
 import wandb
 import torch
 import torch.nn as nn
@@ -212,6 +213,7 @@ def get_batch(step):
 # -----------------------------------------------------------------------------
 # Training loop
 batch_iter = get_batch(0)
+step_start = time.time()
 
 for step in range(num_steps):
     model.train()
@@ -223,7 +225,9 @@ for step in range(num_steps):
 
     rewards_all = []
     logp_all = []
+    logp_ref_all = []
     seq_mask_all = []
+    seq_len_all = []
 
     # Collect rollouts
     for _ in range(args.examples_per_step // world_size):
@@ -243,11 +247,15 @@ for step in range(num_steps):
         logp_ref_seq = (logp_ref * mask).sum(dim=1)
 
         logp_all.append(logp_seq)
+        logp_ref_all.append(logp_ref_seq)
         seq_mask_all.append(mask.any(dim=1))
+        seq_len_all.append(mask.sum(dim=1).float())
 
     rewards = torch.cat(rewards_all)
     logp = torch.cat(logp_all)
+    logp_ref = torch.cat(logp_ref_all)
     valid = torch.cat(seq_mask_all)
+    seq_lens = torch.cat(seq_len_all)
 
     # Advantages
     adv = rewards - rewards.mean()
@@ -274,7 +282,7 @@ for step in range(num_steps):
     # M-step: policy + α
     # -------------------------
     logp = logp[valid]
-    logp_ref = logp_ref_seq[valid]
+    logp_ref = logp_ref[valid]
     psi_v = psi[valid]
 
     policy_loss = -(psi_v * logp).sum()
@@ -286,6 +294,10 @@ for step in range(num_steps):
     total_loss = policy_loss + alpha.detach() * kl_mean
 
     total_loss.backward()
+
+    grad_norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(), max_norm=float("inf")
+    )
 
     for opt in optimizers:
         for g in opt.param_groups:
@@ -302,15 +314,39 @@ for step in range(num_steps):
 
     # Logging
     if master:
-        wandb_run.log(
-            {
-                "step": step,
-                "reward_mean": rewards.mean().item(),
-                "eta": eta.item(),
-                "alpha": alpha.item(),
-                "kl": kl_mean.item(),
-            }
-        )
+        psi_entropy = -(psi * psi.clamp_min(1e-8).log()).sum().item()
+        lr_values = []
+        for opt in optimizers:
+            lr_values.extend([g["lr"] for g in opt.param_groups])
+        lr_mean = sum(lr_values) / len(lr_values) if lr_values else 0.0
+        log_data = {
+            "step": step,
+            "reward_mean": rewards.mean().item(),
+            "reward_std": rewards.std().item(),
+            "reward_max": rewards.max().item(),
+            "reward_min": rewards.min().item(),
+            "valid_frac": valid.float().mean().item(),
+            "seq_len_mean": seq_lens.mean().item(),
+            "adv_mean": adv.mean().item(),
+            "adv_std": adv.std().item(),
+            "psi_entropy": psi_entropy,
+            "eta": eta.item(),
+            "alpha": alpha.item(),
+            "kl": kl_mean.item(),
+            "kl_max": kl.max().item(),
+            "logp_mean": logp.mean().item(),
+            "logp_std": logp.std().item(),
+            "logp_ref_mean": logp_ref.mean().item(),
+            "loss_eta": loss_eta.item(),
+            "loss_alpha": loss_alpha.item(),
+            "grad_norm": (
+                grad_norm.item() if torch.is_tensor(grad_norm) else float(grad_norm)
+            ),
+            "lr_mean": lr_mean,
+            "step_time": time.time() - step_start,
+        }
+        step_start = time.time()
+        wandb_run.log(log_data)
 
     # Checkpoint
     if master and (step % args.save_every == 0 or step == num_steps - 1):
