@@ -345,6 +345,10 @@ class GPT(nn.Module):
             'total': total,
         }
 
+    def setup_optimizers(self, **kwargs):
+        """Backward-compatible wrapper returning a list of optimizers."""
+        return [self.setup_optimizer(**kwargs)]
+
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
