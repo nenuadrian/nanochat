@@ -414,29 +414,15 @@ class GPT(nn.Module):
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
         logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
+        logits = logits.float() # switch to fp32 for logit softcap and loss computation
+        logits = softcap * torch.tanh(logits / softcap) # squash the logits
 
         if targets is not None:
-            if loss_reduction == 'none':
-                logits = softcap * torch.tanh(logits / softcap)
-                log_probs = F.log_softmax(logits, dim=-1)
-                valid = targets != -1
-                if valid.any():
-                    gathered = log_probs[valid].gather(-1, targets[valid].unsqueeze(-1)).squeeze(-1)
-                    token_logp = torch.zeros_like(targets, dtype=gathered.dtype)
-                    token_logp = token_logp.masked_scatter(valid, gathered)
-                else:
-                    token_logp = torch.zeros_like(targets, dtype=logits.dtype)
-                return -token_logp.float()
-
-            logits = logits.float() # switch to fp32 for logit softcap and loss computation
-            logits = softcap * torch.tanh(logits / softcap) # squash the logits
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             return loss
         else:
-            logits = logits.float() # switch to fp32 for logit softcap and loss computation
-            logits = softcap * torch.tanh(logits / softcap) # squash the logits
             # inference: just return the logits directly
             return logits
 
