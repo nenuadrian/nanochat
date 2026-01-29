@@ -419,11 +419,13 @@ class GPT(nn.Module):
             if loss_reduction == 'none':
                 logits = softcap * torch.tanh(logits / softcap)
                 log_probs = F.log_softmax(logits, dim=-1)
-                token_logp = torch.zeros_like(targets, dtype=logits.dtype)
                 valid = targets != -1
                 if valid.any():
                     gathered = log_probs[valid].gather(-1, targets[valid].unsqueeze(-1)).squeeze(-1)
+                    token_logp = torch.zeros_like(targets, dtype=gathered.dtype)
                     token_logp = token_logp.masked_scatter(valid, gathered)
+                else:
+                    token_logp = torch.zeros_like(targets, dtype=logits.dtype)
                 return -token_logp.float()
 
             logits = logits.float() # switch to fp32 for logit softcap and loss computation
