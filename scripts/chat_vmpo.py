@@ -236,8 +236,8 @@ for step in range(num_steps):
     for _ in range(args.examples_per_step // world_size):
         inputs, targets, rewards = next(batch_iter)
         rewards_all.append(rewards)
-        inputs_all.append(inputs)
-        targets_all.append(targets)
+        inputs_all.append(inputs.cpu())
+        targets_all.append(targets.cpu())
 
         with autocast_ctx:
             logp = -model(inputs, targets, loss_reduction="none")
@@ -305,6 +305,16 @@ for step in range(num_steps):
         w = torch.exp(adv_centered / eta) * valid_mask.float()
         psi = w / w.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
+    # Free reference model once ψ is computed to release VRAM/CPU RAM early
+    del ref_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Drop rollout buffers that are no longer needed before M-steps
+    del rewards_all, logp_ref_all, seq_mask_all
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     # -------------------------
     # M-step: policy + α
     # -------------------------
@@ -317,6 +327,8 @@ for step in range(num_steps):
         # Recompute log probabilities with the current policy parameters
         logp_curr = []
         for inputs, targets in zip(inputs_all, targets_all):
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
             with autocast_ctx:
                 logp_tokens = -model(inputs, targets, loss_reduction="none")
                 logp_tokens = logp_tokens.view_as(inputs)
