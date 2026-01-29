@@ -401,6 +401,7 @@ for step in range(num_steps):
             "step_time": time.time() - step_start,
         }
         step_start = time.time()
+        print(log_data)
         wandb_run.log(log_data)
 
     # Checkpoint
