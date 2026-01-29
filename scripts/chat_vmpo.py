@@ -215,13 +215,17 @@ def get_batch(step):
 batch_iter = get_batch(0)
 step_start = time.time()
 
+# Keep a single frozen reference policy on device to avoid per-step deepcopies that
+# balloon GPU memory. We refresh its weights each step via load_state_dict.
+ref_model = copy.deepcopy(model).eval()
+for p in ref_model.parameters():
+    p.requires_grad_(False)
+
 for step in range(num_steps):
     model.train()
 
-    # Snapshot reference policy
-    ref_model = copy.deepcopy(model).eval()
-    for p in ref_model.parameters():
-        p.requires_grad_(False)
+    # Refresh reference policy weights without allocating a new model
+    ref_model.load_state_dict(model.state_dict(), strict=True)
 
     rewards_all = []
     logp_all = []
@@ -340,9 +344,7 @@ for step in range(num_steps):
 
     # Logging
     if master:
-        psi_entropy = (
-            -(psi * psi.clamp_min(1e-8).log()).sum(dim=1).mean().item()
-        )
+        psi_entropy = -(psi * psi.clamp_min(1e-8).log()).sum(dim=1).mean().item()
         lr_values = []
         for opt in optimizers:
             lr_values.extend([g["lr"] for g in opt.param_groups])
