@@ -112,8 +112,13 @@ contributes exactly zero gradient no matter how many rollouts it gets.
 
 After the uniform run in section 6, check these two metrics:
 
-- `alloc/p_spread` — if ~0, there is no difference in difficulty to allocate on.
-- `alloc/p_frac_degenerate` — fraction at `p=0` or `p=1`, which contribute nothing.
+- `realised/p_spread` — if ~0, there is no difference in difficulty to allocate on.
+- `realised/p_frac_degenerate` — fraction at `p=0` or `p=1`, which contribute nothing.
+- `realised/rollouts_wasted` — rollouts spent on those prompts.
+
+Use the `realised/*` series, not `alloc/p_*`. The latter is not comparable across
+allocators: it is *predicted* for VIP, *pilot-measured* for GVM, and absent for
+uniform. The `realised/*` series is measured the same way in all three.
 
 For reference: at 2.3% GSM8K accuracy with `N'=8`, 83% of prompts land at `p=0`
 and 92% of the survivors sit at exactly `p=0.125`. That is not enough spread for
@@ -167,7 +172,9 @@ allocation was effectively uniform and any difference in outcome is noise.
 Also `alloc/min`, `alloc/max`, `alloc/frac_zero`.
 
 **Was there signal to allocate on**
-`alloc/p_spread`, `alloc/p_frac_degenerate`, `alloc/p_frac_zero`. See section 5.
+`realised/p_spread`, `realised/p_frac_degenerate`, `realised/rollouts_wasted`.
+See section 5, and note these are the comparable ones — `alloc/p_*` is predicted
+for VIP but measured for GVM.
 
 **What it actually cost**
 `cost/rollouts_total` and `cost/pilot_overhead`. GVM at `N'=4` with 16 rollouts

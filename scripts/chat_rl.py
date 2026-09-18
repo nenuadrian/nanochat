@@ -80,6 +80,9 @@ parser.add_argument("--gvm-grad-norm", type=str, default="embed", choices=["embe
 # VIP (arXiv:2602.01601): predicts p_i with a GP, no pilot pass
 parser.add_argument("--vip-bandwidth", type=float, default=0.0, help="RBF bandwidth; 0 = median heuristic")
 parser.add_argument("--vip-eps", type=float, default=0.05)
+parser.add_argument("--prompt-pool", type=int, default=0,
+                    help="cap the prompt set for ALL allocators, so a VIP run and a "
+                         "uniform run see the same data; 0 = no cap (auto-set for VIP)")
 parser.add_argument("--vip-embed-prompts", type=int, default=1024,
                     help="size of the prompt pool the GP is fitted over")
 # Which gradient estimator to form once the rollouts exist
@@ -117,11 +120,22 @@ print0(f"Calculated number of steps: {num_steps}")
 # -----------------------------------------------------------------------------
 # Allocation machinery: pilot rollouts for GVM, a GP for VIP.
 
-# Budget is per rank: each rank allocates across the prompts it owns. Equals
-# what uniform would spend, so every allocator is compared at equal budget.
-step_budget = args.examples_per_step * args.num_samples   # global, for logging only
 alloc_min = args.alloc_min if args.alloc_min > 0 else (3 if args.allocator == "vip" else 0)
-alloc_max = args.alloc_max if args.alloc_max > 0 else step_budget
+
+# The prompts this rank will cycle through. VIP needs an embedding per prompt for
+# its GP, so its pool is capped -- and the cap is applied to EVERY allocator, or
+# uniform and GVM would see a larger prompt set than VIP and the comparison would
+# be confounded by data, not allocation.
+rank_indices = list(range(ddp_rank, len(train_task), ddp_world_size))
+pool_cap = args.prompt_pool if args.prompt_pool > 0 else (
+    args.vip_embed_prompts if args.allocator == "vip" else 0)
+if pool_cap > 0:
+    rank_indices = rank_indices[:pool_cap]
+# Exact position of each prompt in the pool. Using `idx % pool_size` instead
+# would silently collide unrelated prompts onto the same GP entry.
+pool_pos = {int(idx): i for i, idx in enumerate(rank_indices)}
+print0(f"Prompt pool for this rank: {len(rank_indices)} prompts"
+       + (f" (capped from {len(range(ddp_rank, len(train_task), ddp_world_size))})" if pool_cap else ""))
 
 @torch.no_grad()
 def prompt_embeddings(indices):
@@ -172,25 +186,25 @@ def gvm_pilot(example_idx, n_pilot, step):
     prev = emb.requires_grad
     emb.requires_grad_(True)
     norms = []
-    for seq in correct:
-        ids = torch.tensor(seq, dtype=torch.long, device=device)[None, :]
-        inp, tgt = ids[:, :-1], ids[:, 1:].clone()
-        tgt[:, : prefix_len - 1] = -1                      # score only the completion
-        nll = model(inp, tgt, loss_reduction='sum')
-        g, = torch.autograd.grad(nll, [emb], retain_graph=False)
-        norms.append(float(g.norm(p=2).item()))
-        model.zero_grad(set_to_none=True)
+    # This runs inside get_step_batches, which is @torch.no_grad(); without
+    # re-enabling grad the forward produces no graph and autograd.grad raises.
+    with torch.enable_grad():
+        for seq in correct:
+            ids = torch.tensor(seq, dtype=torch.long, device=device)[None, :]
+            inp, tgt = ids[:, :-1], ids[:, 1:].clone()
+            tgt[:, : prefix_len - 1] = -1                  # score only the completion
+            nll = model(inp, tgt, loss_reduction='sum')
+            g, = torch.autograd.grad(nll, [emb], retain_graph=False)
+            norms.append(float(g.norm(p=2).item()))
+            model.zero_grad(set_to_none=True)
     emb.requires_grad_(prev)
     return p_i, float(np.mean(norms)) if norms else 0.0
 
 vip_gp = None
-vip_pool = None
 if args.allocator == "vip":
-    pool_size = min(args.vip_embed_prompts, len(train_task))
-    vip_pool = np.arange(pool_size)
-    print0(f"VIP: embedding {pool_size} prompts for the GP prior...")
+    print0(f"VIP: embedding {len(rank_indices)} prompts for the GP prior...")
     vip_gp = PromptSuccessGP(
-        prompt_embeddings(vip_pool),
+        prompt_embeddings(rank_indices),
         bandwidth=args.vip_bandwidth if args.vip_bandwidth > 0 else None,
         eps=args.vip_eps,
         reward_range=(0.0, 1.0),      # GSM8K reward is 0/1, not -1/+1
@@ -216,7 +230,7 @@ def allocate(indices, step):
              "alloc/G_mean": float(np.mean(G)), "alloc/G_max": float(np.max(G))}
         return n, m
     # vip
-    local = np.array([int(i) % len(vip_pool) for i in indices])   # map into the GP pool
+    local = np.array([pool_pos[int(i)] for i in indices])   # exact position in the GP pool
     p_hat = vip_gp.predict(local)
     n = vip_allocation(p_hat, step_budget, lo=max(alloc_min, 3), hi=alloc_max)
     m = {**allocation_stats(n, p_hat), **rollout_accounting(n, 0)}
@@ -275,7 +289,6 @@ def rollout_one(example_idx, n_rollouts, step, assistant_end):
 def get_step_batches():
     """Yield one whole step at a time: allocation is a batch-level decision."""
     assistant_end = tokenizer.encode_special("<|assistant_end|>")
-    rank_indices = list(range(ddp_rank, len(train_task), ddp_world_size))
     cycler = itertools.cycle(rank_indices)
     step = 0
     while True:
@@ -290,6 +303,23 @@ def get_step_batches():
             records.append(rollout_one(example_idx, n_i, step, assistant_end))
         alloc_metrics["alloc/prompts_used"] = float(len(records))
         alloc_metrics["alloc/prompts_skipped"] = float(len(indices) - len(records))
+        # Realised accept rates, measured identically for every allocator. The
+        # alloc/p_* series is not comparable across allocators -- it is predicted
+        # for VIP, pilot-measured for GVM, absent for uniform -- so the decision
+        # of whether a run had any difficulty signal must be made on these.
+        if records:
+            ps = np.array([r["p_hat"] for r in records], dtype=float)
+            alloc_metrics.update({
+                "realised/p_mean": float(ps.mean()),
+                "realised/p_spread": float(ps.std()),
+                "realised/p_frac_zero": float((ps <= 0).mean()),
+                "realised/p_frac_one": float((ps >= 1).mean()),
+                # p=0 or p=1 means every advantage in the group is zero under
+                # mean subtraction, so the prompt contributes no gradient at all.
+                "realised/p_frac_degenerate": float(((ps <= 0) | (ps >= 1)).mean()),
+                "realised/rollouts_wasted": float(
+                    sum(r["n"] for r in records if r["p_hat"] <= 0 or r["p_hat"] >= 1)),
+            })
         yield records, alloc_metrics
         step += 1
 
@@ -407,11 +437,20 @@ for step in range(num_steps):
         total_valid = max(total_valid, 1)
     inv_np = {}
     if args.estimator_weight == "inv_np":
-        for r in records:
+        raw, toks = {}, {}
+        for pos, r in enumerate(records):
             # E[accepted] = n_i * p_i; guard the p_i = 0 case, which contributes
             # no gradient anyway since every advantage in that group is zero.
-            denom = r["n"] * max(r["p_hat"], 1e-6)
-            inv_np[r["idx"]] = 1.0 / denom
+            raw[pos] = 1.0 / (r["n"] * max(r["p_hat"], 1e-6))
+            toks[pos] = max(int((r["targets"] >= 0).sum().item()), 1)
+        # Rescale so the total weight over the step is 1, matching what per_prompt
+        # and per_token already sum to. Without this the raw 1/(n_i p_i) weights
+        # are ~40x larger and switching estimator would silently change the
+        # effective learning rate -- the ablation would measure that, not the
+        # estimator. Relative weighting across prompts is untouched.
+        mass = sum(raw[k] * toks[k] for k in raw) or 1.0
+        for k in raw:
+            inv_np[k] = raw[k] / mass
 
     n_prompts = max(len(records), 1)
     for example_step, rec in enumerate(records):
@@ -433,7 +472,7 @@ for step in range(num_steps):
                 pg_obj = pg_obj / total_valid
             elif args.estimator_weight == "inv_np":
                 # Lemma 1's unbiased estimator, averaged over prompts.
-                pg_obj = pg_obj * (inv_np[rec["idx"]] / n_prompts)
+                pg_obj = pg_obj * inv_np[example_step]
             else:  # per_prompt (nanochat's original behaviour)
                 num_valid = (targets >= 0).sum().clamp(min=1)
                 pg_obj = pg_obj / (num_valid * num_passes * n_prompts)
@@ -449,7 +488,7 @@ for step in range(num_steps):
     # Calibration is logged BEFORE the update, so it scores a genuine prediction
     # rather than the value just fitted to.
     if vip_gp is not None and records:
-        local = np.array([r["idx"] % len(vip_pool) for r in records])
+        local = np.array([pool_pos[r["idx"]] for r in records])
         realised = np.array([r["p_hat"] for r in records])
         alloc_metrics.update(vip_gp.calibration(local, realised))
         vip_gp.update(local, realised)
