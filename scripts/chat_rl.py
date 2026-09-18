@@ -1,5 +1,5 @@
 """
-Reinforcement learning on GSM8K via "GRPO".
+Reinforcement learning via "GRPO", on GSM8K or ARC (see --task).
 
 I put GRPO in quotes because we actually end up with something a lot
 simpler and more similar to just REINFORCE:
@@ -27,6 +27,7 @@ from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir,
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
 from tasks.gsm8k import GSM8K
+from tasks.arc import ARC
 from nanochat.allocation import (
     uniform_allocation, gvm_allocation, vip_allocation,
     allocation_stats, rollout_accounting,
@@ -35,7 +36,7 @@ from nanochat.vip_gp import PromptSuccessGP
 
 # -----------------------------------------------------------------------------
 # CLI arguments
-parser = argparse.ArgumentParser(description="Reinforcement learning on GSM8K")
+parser = argparse.ArgumentParser(description="Reinforcement learning on GSM8K or ARC")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
@@ -44,7 +45,13 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
 # Training horizon
-parser.add_argument("--num-epochs", type=int, default=1, help="number of epochs over GSM8K")
+parser.add_argument("--task", type=str, default="gsm8k",
+                    choices=["gsm8k", "arc-easy", "arc-challenge"],
+                    help="RL task. GSM8K is what nanochat shipped with, but a small model "
+                         "scores ~2%% on it, which leaves every prompt at p=0 and nothing for "
+                         "a budget allocator to allocate on. ARC is multiple-choice and lands "
+                         "near p=0.5, where the allocators actually differ.")
+parser.add_argument("--num-epochs", type=int, default=1, help="number of epochs over the task")
 # Batch sizes / sampling
 parser.add_argument("--device-batch-size", type=int, default=8, help="max batch size per forward pass")
 parser.add_argument("--examples-per-step", type=int, default=16, help="total examples per optimization step across all ranks")
@@ -112,8 +119,14 @@ engine = Engine(model, tokenizer) # for sampling rollouts
 # -----------------------------------------------------------------------------
 # Rollout / sampling generator loop that yields batches of examples for training
 
-train_task = GSM8K(subset="main", split="train")
-val_task = GSM8K(subset="main", split="test")
+if args.task == "gsm8k":
+    train_task = GSM8K(subset="main", split="train")
+    val_task = GSM8K(subset="main", split="test")
+else:
+    subset = "ARC-Easy" if args.task == "arc-easy" else "ARC-Challenge"
+    train_task = ARC(subset=subset, split="train")
+    val_task = ARC(subset=subset, split="test")
+print0(f"Task: {args.task} | train {len(train_task)} | val {len(val_task)}")
 num_steps = (len(train_task) // args.examples_per_step) * args.num_epochs
 print0(f"Calculated number of steps: {num_steps}")
 
@@ -207,7 +220,7 @@ if args.allocator == "vip":
         prompt_embeddings(rank_indices),
         bandwidth=args.vip_bandwidth if args.vip_bandwidth > 0 else None,
         eps=args.vip_eps,
-        reward_range=(0.0, 1.0),      # GSM8K reward is 0/1, not -1/+1
+        reward_range=(0.0, 1.0),      # both tasks give 0/1 rewards, not -1/+1
     )
     print0(f"VIP: GP ready, bandwidth={vip_gp.h:.4f}")
 
@@ -324,8 +337,8 @@ def get_step_batches():
         step += 1
 
 # -----------------------------------------------------------------------------
-# Simple evaluation loop for GSM8K pass@k
-def run_gsm8k_eval(task, tokenizer, engine,
+# Simple evaluation loop for pass@k on the chosen task
+def run_task_eval(task, tokenizer, engine,
     max_examples=None,
     num_samples=1,
     max_completion_tokens=256,
@@ -333,7 +346,7 @@ def run_gsm8k_eval(task, tokenizer, engine,
     top_k=50
 ):
     """
-    Evaluates GSM8K task and returns a list of records of evaluation outcomes.
+    Evaluates the task and returns a list of records of evaluation outcomes.
     In a distributed setting, all ranks cooperate but this function will NOT
     do the reduction across ranks. This is the responsibility of the caller.
     Because the evaluation can take a while, this function will yield records one by one.
@@ -357,7 +370,7 @@ def run_gsm8k_eval(task, tokenizer, engine,
         for sample_tokens in generated_token_sequences:
             generated_tokens = sample_tokens[prefix_length:]
             generated_text = tokenizer.decode(generated_tokens)
-            is_correct = task.evaluate(conversation, generated_text)
+            is_correct = task.reward(conversation, generated_text) > 0
             outcomes.append({
                 "is_correct": is_correct
             })
@@ -403,7 +416,7 @@ for step in range(num_steps):
     if step % args.eval_every == 0:
         model.eval()
         passk = torch.zeros(args.device_batch_size, device=device) # pass@k for k=1..device_batch_size
-        records_iter = run_gsm8k_eval(val_task, tokenizer, engine, num_samples=args.device_batch_size, max_examples=args.eval_examples, temperature=1.0)
+        records_iter = run_task_eval(val_task, tokenizer, engine, num_samples=args.device_batch_size, max_examples=args.eval_examples, temperature=1.0)
         records = list(records_iter) # collect all records
         for k in range(1, args.device_batch_size + 1):
             passk[k - 1] = sum(any(o["is_correct"] for o in r["outcomes"][:k]) for r in records)

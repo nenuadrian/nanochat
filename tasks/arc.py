@@ -3,6 +3,7 @@ The ARC dataset from Allen AI.
 https://huggingface.co/datasets/allenai/ai2_arc
 """
 
+import re
 from tasks.common import Task, load_hub_dataset, render_mc
 
 class ARC(Task):
@@ -38,6 +39,33 @@ class ARC(Task):
             "letters": letters, # useful during evaluation, so we can narrow and clamp the assistant prediction to one of the letters
         }
         return conversation
+
+    @staticmethod
+    def extract_choice(response, letters):
+        """Pull a choice letter out of free-form generated text, or None.
+
+        evaluate() below can assume a bare letter because the eval harness scores
+        categorically -- it picks among the letters by likelihood. RL generates
+        instead, so the response is whatever the model felt like emitting and may
+        not be a letter at all. Returning None (-> reward 0) is the correct
+        outcome for an unparseable answer, not an error.
+        """
+        s = response.strip()
+        if s in letters:
+            return s
+        # Tolerate "A.", "(A)", "Answer: A". \b stops "A" matching inside a word
+        # like "Apple". First match wins: the prompt asks for the letter only, so
+        # the model is trained to lead with it.
+        m = re.search(r"\b(" + "|".join(re.escape(l) for l in letters) + r")\b", s)
+        return m.group(1) if m else None
+
+    def reward(self, conversation, assistant_response):
+        """Used during RL. Unlike evaluate(), never raises on a malformed answer."""
+        letters = conversation["letters"]
+        pred = self.extract_choice(assistant_response, letters)
+        if pred is None:
+            return 0.0
+        return float(pred == conversation["messages"][-1]["content"])
 
     def evaluate(self, conversation, assistant_response):
         # the assert here is not strictly speaking needed, but currently the way we eval, we expect this to be true

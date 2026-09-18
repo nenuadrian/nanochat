@@ -90,3 +90,41 @@ def test_metrics_flag_a_degenerate_batch():
     assert s["alloc/p_frac_degenerate"] == pytest.approx(0.8)
     c = rollout_accounting(n_train=[8] * 16, n_pilot=[4] * 16)
     assert c["cost/rollouts_total"] == 192 and c["cost/pilot_overhead"] == pytest.approx(0.5)
+
+
+# --- ARC reward parsing ------------------------------------------------------
+# ARC.evaluate() asserts a bare letter, which only holds for the categorical eval
+# harness. RL generates free text, so reward() must parse it and never raise.
+
+def test_arc_extract_choice():
+    from tasks.arc import ARC
+    L = ["A", "B", "C", "D"]
+    assert ARC.extract_choice("A", L) == "A"
+    assert ARC.extract_choice("  B  ", L) == "B"
+    assert ARC.extract_choice("C.", L) == "C"
+    assert ARC.extract_choice("(D)", L) == "D"
+    assert ARC.extract_choice("Answer: B", L) == "B"
+    assert ARC.extract_choice("The answer is C.", L) == "C"
+    # must not match a letter embedded in a word
+    assert ARC.extract_choice("Apple", L) is None
+    # unparseable is a legitimate wrong answer, not an error
+    assert ARC.extract_choice("", L) is None
+    assert ARC.extract_choice("banana", L) is None
+    assert ARC.extract_choice("E", L) is None
+
+
+def test_arc_reward_never_raises_on_garbage():
+    from tasks.arc import ARC
+    conv = {"messages": [{"role": "user", "content": "q"},
+                         {"role": "assistant", "content": "B"}],
+            "letters": ["A", "B", "C", "D"]}
+    # Subclass to skip ARC.__init__, which would download the dataset.
+    class _NoLoad(ARC):
+        def __init__(self):
+            pass
+    task = _NoLoad()
+    assert task.reward(conv, "B") == 1.0
+    assert task.reward(conv, "Answer: B") == 1.0
+    assert task.reward(conv, "A") == 0.0
+    assert task.reward(conv, "complete nonsense") == 0.0
+    assert task.reward(conv, "") == 0.0

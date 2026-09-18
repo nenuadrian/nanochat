@@ -47,9 +47,32 @@ python -m scripts.tok_eval
 
 ## 2. Base model (pretraining)
 
-`speedrun.sh` is written for 8xH100. On an iMac use the CPU/MPS shape from
-`runs/runcpu.sh`. Go as deep as you can afford — see the warning in section 5,
-model capability is the binding constraint on this whole experiment.
+`speedrun.sh` is written for 8xH100. On an iMac use the CPU/MPS shape below.
+
+**On depth.** Memory is not the constraint — even d26 needs only ~17 GB. Compute
+is. nanochat trains compute-optimal (`tokens = params x 10.5`), so FLOPs grow as
+`63 x params^2`:
+
+| depth | params | opt. tokens | hrs @3 TFLOPS | hrs @10 TFLOPS |
+|------:|-------:|------------:|--------------:|---------------:|
+| 6     | 74M    | 0.8B        | 31            | 9.5            |
+| 8     | 126M   | 1.3B        | 92            | 28             |
+| 12    | 286M   | 3.0B        | 478           | 143            |
+| 20    | 896M   | 9.4B        | 4688          | 1407           |
+
+Measure your own throughput before committing to a size — run 20 iterations,
+read tok/s, and multiply by `6 x params`:
+
+```bash
+python -m scripts.base_train --depth=6 --head-dim=64 --window-pattern=L \
+    --max-seq-len=512 --device-batch-size=32 --total-batch-size=16384 \
+    --num-iterations=20 --core-metric-every=-1 --run=dummy
+```
+
+**depth 6 is the realistic target on an iMac.** The `--num-iterations=5000`
+setting below is deliberately ~10x undertrained relative to compute-optimal,
+which is the right trade here: see section 5, capability is not what this
+experiment is measuring.
 
 ```bash
 python -m scripts.base_train \
@@ -90,7 +113,7 @@ Before any real run. Confirms the allocator plumbing works end to end.
 
 ```bash
 for A in uniform gvm vip; do
-  python -m scripts.chat_rl --allocator=$A \
+  python -m scripts.chat_rl --task=arc-challenge --allocator=$A \
       --examples-per-step=4 --num-samples=4 --device-batch-size=2 \
       --gvm-pilot-samples=2 --vip-embed-prompts=64 \
       --max-new-tokens=64 --num-epochs=1 --eval-every=-1 --save-every=-1 --run=dummy
@@ -103,12 +126,25 @@ and `vip`, and constant for `uniform`.
 
 ---
 
-## 5. Read this before running the experiments
+## 5. Read this before running the experiments — pick the right task
 
 GVM and VIP both allocate on how hard each prompt is. **If the model solves
 almost nothing, every prompt looks equally hard and all three allocators collapse
 to the same thing.** Under mean-subtracted advantage a prompt with `p=0` or `p=1`
 contributes exactly zero gradient no matter how many rollouts it gets.
+
+This is why `--task` exists and why **GSM8K is the wrong choice at this scale**.
+Measured on a d12 (already well beyond what an iMac reaches):
+
+| task | d12 score | usable for allocation? |
+|------|----------:|------------------------|
+| GSM8K         | 2.3%  | no — ~83% of prompts sit at p=0 |
+| ARC-Challenge | 50.5% | **yes — p near 0.5, where VIP's objective peaks** |
+| ARC-Easy      | 61.2% | yes |
+| MMLU          | 35.7% | yes (no reward() yet) |
+
+So run the experiments with `--task=arc-challenge`. GSM8K stays useful as a
+held-out eval, just not as the RL task.
 
 After the uniform run in section 6, check these two metrics:
 
@@ -134,16 +170,16 @@ Same budget in all three: 16 prompts x 16 rollouts = 256 rollouts per step.
 
 ```bash
 # baseline
-python -m scripts.chat_rl --allocator=uniform \
+python -m scripts.chat_rl --task=arc-challenge --allocator=uniform \
     --examples-per-step=16 --num-samples=16 --run=rl-uniform
 
 # GVM: 4 pilot rollouts per prompt to measure p and G  (note the extra cost)
-python -m scripts.chat_rl --allocator=gvm --gvm-pilot-samples=4 \
+python -m scripts.chat_rl --task=arc-challenge --allocator=gvm --gvm-pilot-samples=4 \
     --gvm-alpha=0.001 --gvm-beta=2.0 \
     --examples-per-step=16 --num-samples=16 --run=rl-gvm
 
 # VIP: no pilot pass, p predicted by the GP
-python -m scripts.chat_rl --allocator=vip --alloc-min=3 \
+python -m scripts.chat_rl --task=arc-challenge --allocator=vip --alloc-min=3 \
     --vip-embed-prompts=1024 \
     --examples-per-step=16 --num-samples=16 --run=rl-vip
 ```
@@ -152,14 +188,14 @@ python -m scripts.chat_rl --allocator=vip --alloc-min=3 \
 
 ```bash
 # Is GVM's gain from the accept rate, or from the gradient-norm term?
-python -m scripts.chat_rl --allocator=gvm --gvm-grad-norm=off --run=rl-gvm-noG
+python -m scripts.chat_rl --task=arc-challenge --allocator=gvm --gvm-grad-norm=off --run=rl-gvm-noG
 
 # How the per-prompt contributions are weighted. Default `per_prompt` matches
 # GVM's Algorithm 1 line 8. `per_token` reproduces what verl actually does,
 # where a prompt's weight grows with the rollouts it was allocated -- i.e. the
 # set GVM deliberately oversamples. `inv_np` is Lemma 1's estimator explicitly.
-python -m scripts.chat_rl --allocator=gvm --estimator-weight=per_token --run=rl-gvm-pertoken
-python -m scripts.chat_rl --allocator=gvm --estimator-weight=inv_np   --run=rl-gvm-invnp
+python -m scripts.chat_rl --task=arc-challenge --allocator=gvm --estimator-weight=per_token --run=rl-gvm-pertoken
+python -m scripts.chat_rl --task=arc-challenge --allocator=gvm --estimator-weight=inv_np   --run=rl-gvm-invnp
 ```
 
 ---
