@@ -86,6 +86,13 @@ else:
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
 
+def compute_grad_norm(optimizer):
+    """Global L2 norm over all gradients. One fused kernel + one sync, so only call on logging steps."""
+    grads = [p.grad for group in optimizer.param_groups for p in group["params"] if p.grad is not None]
+    if not grads:
+        return None
+    return torch.linalg.vector_norm(torch.stack(torch._foreach_norm(grads))).item()
+
 # Flash Attention status
 if not HAS_FA3:
     print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
@@ -350,6 +357,7 @@ while True:
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
+            "val/bpb_min": min_val_bpb,
         })
         model.train()
 
@@ -439,14 +447,20 @@ while True:
         group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
+    grad_norm = None # global grad norm, only measured on wandb logging steps (costs a sync)
+    will_log_wandb = (step + 1) % 10 == 0 # step is incremented below, before the logging block
     if scaler is not None:
         scaler.unscale_(optimizer)
         if is_ddp_initialized():
             for v in scaler._found_inf_per_device(optimizer).values():
                 dist.all_reduce(v, op=dist.ReduceOp.MAX)
+        if will_log_wandb:
+            grad_norm = compute_grad_norm(optimizer)
         scaler.step(optimizer)
         scaler.update()
     else:
+        if will_log_wandb:
+            grad_norm = compute_grad_norm(optimizer)
         optimizer.step()
     model.zero_grad(set_to_none=True)
     synchronize()
@@ -458,7 +472,8 @@ while True:
     step += 1
 
     # logging
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
+    train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
+    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
     pct_done = 100 * progress
     tok_per_sec = int(args.total_batch_size / dt)
@@ -468,17 +483,29 @@ while True:
         total_training_time += dt # only count the time after the first 10 steps
     print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {current_epoch} | total time: {total_training_time/60:.2f}m")
     if step % 10 == 0:
-        wandb_run.log({
+        log_data = {
             "step": step,
+            "progress_pct": pct_done,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
+            "total_tokens": args.total_batch_size * step,
             "train/loss": debiased_smooth_loss,
+            "train/loss_raw": train_loss_f, # last micro-batch, unsmoothed
             "train/lrm": lrm,
+            "train/muon_momentum": muon_momentum,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": current_epoch,
-        })
+        }
+        if grad_norm is not None:
+            log_data["train/grad_norm"] = grad_norm
+        if scaler is not None:
+            log_data["train/grad_scaler_scale"] = scaler.get_scale()
+        if device_type == "cuda":
+            log_data["train/mem_alloc_gib"] = torch.cuda.memory_allocated() / 2**30
+            log_data["train/mem_peak_gib"] = torch.cuda.max_memory_allocated() / 2**30
+        wandb_run.log(log_data)
 
     # The garbage collector spends ~500ms scanning for cycles quite frequently.
     # We manually manage it to avoid these pauses during training.
@@ -493,6 +520,13 @@ while True:
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 print0(f"Minimum validation bpb: {min_val_bpb:.4f}")
+
+# log final summary stats to wandb
+wandb_run.log({
+    "final/peak_memory_mib": get_max_memory() / 1024 / 1024,
+    "final/total_training_time_min": total_training_time / 60,
+    "final/min_val_bpb": min_val_bpb,
+})
 
 # cleanup
 wandb_run.finish() # wandb run finish

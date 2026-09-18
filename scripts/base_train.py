@@ -99,6 +99,13 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
 
+def compute_grad_norm(optimizer):
+    """Global L2 norm over all gradients. One fused kernel + one sync, so only call on logging steps."""
+    grads = [p.grad for group in optimizer.param_groups for p in group["params"] if p.grad is not None]
+    if not grads:
+        return None
+    return torch.linalg.vector_norm(torch.stack(torch._foreach_norm(grads))).item()
+
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3
 using_fa3 = USE_FA3
@@ -356,6 +363,17 @@ print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
+# Record the derived (non-CLI) run parameters into the wandb config too
+if not use_dummy_wandb:
+    wandb_run.config.update({
+        "num_scaling_params": num_scaling_params,
+        "num_flops_per_token": num_flops_per_token,
+        "num_iterations": num_iterations,
+        "computed_total_batch_size": total_batch_size,
+        "total_tokens": total_tokens,
+        "ddp_world_size": ddp_world_size,
+    }, allow_val_change=True)
+
 # Learning rate schedule (linear warmup, constant, linear warmdown)
 def get_lr_multiplier(it):
     warmup_iters = args.warmup_steps
@@ -432,6 +450,7 @@ while True:
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
+            "val/bpb_min": min_val_bpb,
         })
         model.train()
 
@@ -525,6 +544,8 @@ while True:
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
+    grad_norm = None # global grad norm, only measured on wandb logging steps (costs a sync)
+    will_log_wandb = step % 100 == 0
     if scaler is not None:
         scaler.unscale_(optimizer)
         # In distributed training, all ranks must agree on whether to skip the step.
@@ -533,9 +554,13 @@ while True:
         if is_ddp_initialized():
             for v in scaler._found_inf_per_device(optimizer).values():
                 dist.all_reduce(v, op=dist.ReduceOp.MAX)
+        if will_log_wandb:
+            grad_norm = compute_grad_norm(optimizer)
         scaler.step(optimizer)
         scaler.update()
     else:
+        if will_log_wandb:
+            grad_norm = compute_grad_norm(optimizer)
         optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
@@ -565,18 +590,35 @@ while True:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
-    if step % 100 == 0:
+    if will_log_wandb:
         log_data = {
             "step": step,
+            "progress_pct": pct_done,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
+            "total_tokens": total_batch_size * step,
             "train/loss": debiased_smooth_loss,
+            "train/loss_raw": train_loss_f, # last micro-batch, unsmoothed
             "train/lrm": lrm,
+            "train/muon_momentum": muon_momentum,
+            "train/muon_weight_decay": muon_weight_decay,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
+            "train/epoch_num": dataloader_state_dict["epoch"],
+            "train/pq_idx": dataloader_state_dict["pq_idx"],
+            "train/rg_idx": dataloader_state_dict["rg_idx"],
         }
+        if grad_norm is not None:
+            log_data["train/grad_norm"] = grad_norm
+        if scaler is not None:
+            log_data["train/grad_scaler_scale"] = scaler.get_scale()
+        if steps_done > 0:
+            log_data["train/eta_min"] = eta_seconds / 60
+        if device_type == "cuda":
+            log_data["train/mem_alloc_gib"] = torch.cuda.memory_allocated() / 2**30
+            log_data["train/mem_peak_gib"] = torch.cuda.max_memory_allocated() / 2**30
         wandb_run.log(log_data)
 
     # state update
@@ -598,6 +640,15 @@ print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 if val_bpb is not None:
     print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
+
+# log final summary stats to wandb
+final_log = {
+    "final/peak_memory_mib": get_max_memory() / 1024 / 1024,
+    "final/total_training_time_min": total_training_time / 60,
+}
+if val_bpb is not None:
+    final_log["final/min_val_bpb"] = min_val_bpb
+wandb_run.log(final_log)
 
 # cleanup
 wandb_run.finish() # wandb run finish
