@@ -20,12 +20,18 @@ import argparse
 import os
 import itertools
 import wandb
+import numpy as np
 import torch
 import torch.distributed as dist
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
 from tasks.gsm8k import GSM8K
+from nanochat.allocation import (
+    uniform_allocation, gvm_allocation, vip_allocation,
+    allocation_stats, rollout_accounting,
+)
+from nanochat.vip_gp import PromptSuccessGP
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -56,6 +62,32 @@ parser.add_argument("--init-lr-frac", type=float, default=0.05, help="initial LR
 # Evaluation / checkpointing
 parser.add_argument("--eval-every", type=int, default=60, help="evaluate pass@k every N steps")
 parser.add_argument("--eval-examples", type=int, default=400, help="number of examples for pass@k evaluation")
+# --- rollout budget allocation -------------------------------------------
+parser.add_argument("--allocator", type=str, default="uniform", choices=["uniform", "gvm", "vip"],
+                    help="how to split the rollout budget across prompts in a step")
+parser.add_argument("--alloc-min", type=int, default=0,
+                    help="minimum rollouts per prompt (VIP's Theorem 5.1 needs >=3)")
+parser.add_argument("--alloc-max", type=int, default=0,
+                    help="maximum rollouts per prompt; 0 means the whole step budget")
+# GVM (arXiv:2505.02391): measures p_i and G_i with a pilot pass
+parser.add_argument("--gvm-pilot-samples", type=int, default=4,
+                    help="N', pilot rollouts per prompt used to measure p_i and G_i")
+parser.add_argument("--gvm-alpha", type=float, default=1e-3)
+parser.add_argument("--gvm-beta", type=float, default=2.0)
+parser.add_argument("--gvm-grad-norm", type=str, default="embed", choices=["embed", "off"],
+                    help="'embed' takes ||grad|| wrt the token embedding as G_i (as the GVM repo does); "
+                         "'off' fixes G_i=1, isolating the accept-rate half of Proposition 1")
+# VIP (arXiv:2602.01601): predicts p_i with a GP, no pilot pass
+parser.add_argument("--vip-bandwidth", type=float, default=0.0, help="RBF bandwidth; 0 = median heuristic")
+parser.add_argument("--vip-eps", type=float, default=0.05)
+parser.add_argument("--vip-embed-prompts", type=int, default=1024,
+                    help="size of the prompt pool the GP is fitted over")
+# Which gradient estimator to form once the rollouts exist
+parser.add_argument("--estimator-weight", type=str, default="per_prompt",
+                    choices=["per_prompt", "per_token", "inv_np"],
+                    help="per_prompt: equal weight per prompt (GVM Alg.1 line 8, nanochat default); "
+                         "per_token: global token-mean, so weight grows with n_i (what verl does); "
+                         "inv_np: explicit 1/(n_i p_i) weighting from GVM Lemma 1")
 parser.add_argument("--save-every", type=int, default=60, help="save checkpoint every N steps")
 args = parser.parse_args()
 user_config = vars(args).copy()
@@ -82,68 +114,184 @@ val_task = GSM8K(subset="main", split="test")
 num_steps = (len(train_task) // args.examples_per_step) * args.num_epochs
 print0(f"Calculated number of steps: {num_steps}")
 
+# -----------------------------------------------------------------------------
+# Allocation machinery: pilot rollouts for GVM, a GP for VIP.
+
+# Budget is per rank: each rank allocates across the prompts it owns. Equals
+# what uniform would spend, so every allocator is compared at equal budget.
+step_budget = args.examples_per_step * args.num_samples   # global, for logging only
+alloc_min = args.alloc_min if args.alloc_min > 0 else (3 if args.allocator == "vip" else 0)
+alloc_max = args.alloc_max if args.alloc_max > 0 else step_budget
+
 @torch.no_grad()
-def get_batch():
-    assistant_end = tokenizer.encode_special("<|assistant_end|>") # ok to use this token, it's only for padding and isn't used in the loss.
-    rank_indices = range(ddp_rank, len(train_task), ddp_world_size) # each rank is responsible for different examples in the training data
-    for example_idx in itertools.cycle(rank_indices):
+def prompt_embeddings(indices):
+    """Mean hidden state over the prompt tokens, one vector per prompt.
 
-        # First get the full conversation of both user and assistant messages
-        conversation = train_task[example_idx]
+    VIP needs a representation to put a kernel over; the paper uses the model's
+    own embeddings of the prompt.
+    """
+    model.eval()
+    out = []
+    wte = model.transformer.wte
+    for i in indices:
+        toks = tokenizer.render_for_completion(train_task[int(i)])
+        ids = torch.tensor(toks[-256:], dtype=torch.long, device=device)[None, :]
+        out.append(wte(ids).float().mean(dim=1).squeeze(0).cpu().numpy())
+    return np.stack(out)
 
-        # Tokenize the conversation, deleting the last Assistant message and priming the Assistant for a completion instead
-        # (i.e. keep the <|assistant_start|>, but delete everything after it)
-        tokens = tokenizer.render_for_completion(conversation)
-        prefix_length = len(tokens)
+def gvm_pilot(example_idx, n_pilot, step):
+    """GVM's E-step for one prompt: measure the accept rate p_i and gradient norm G_i.
 
-        # Generate num_samples samples using batched generation, use loop to avoid OOMs
-        model.eval() # ensure the model is in eval mode
-        generated_token_sequences = []
-        masks = []
-        num_sampling_steps = args.num_samples // args.device_batch_size # go sequentially to prevent OOMs
-        for sampling_step in range(num_sampling_steps):
-            seed = hash((step, example_idx, sampling_step)) & 0x7FFFFFFF # positive half of int32
-            generated_token_sequences_batch, masks_batch = engine.generate_batch(
-                tokens,
-                num_samples=args.device_batch_size,
-                max_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_k=args.top_k,
-                seed=seed, # must make sure to change the seed for each sampling step
-            )
-            generated_token_sequences.extend(generated_token_sequences_batch)
-            masks.extend(masks_batch)
+    These are the two quantities Proposition 1 balances. Note the rollouts drawn
+    here are thrown away afterwards -- the training rollouts are drawn fresh --
+    which is why `cost/rollouts_pilot` is tracked separately.
+    """
+    conversation = train_task[int(example_idx)]
+    toks = tokenizer.render_for_completion(conversation)
+    prefix_len = len(toks)
+    seqs, _ = engine.generate_batch(
+        toks, num_samples=n_pilot, max_tokens=args.max_new_tokens,
+        temperature=args.temperature, top_k=args.top_k,
+        seed=hash(("pilot", step, int(example_idx))) & 0x7FFFFFFF,
+    )
+    correct = []
+    for seq in seqs:
+        text = tokenizer.decode(seq[prefix_len:])
+        if train_task.reward(conversation, text) > 0:
+            correct.append(seq)
+    p_i = len(correct) / max(n_pilot, 1)
+    if not correct or args.gvm_grad_norm == "off":
+        # G_i is undefined with no accepted sample; Proposition 1 sends n_i to 0.
+        return p_i, (1.0 if (correct and args.gvm_grad_norm == "off") else 0.0)
 
-        # Calculate the rewards for each sample
-        rewards = []
-        for sample_tokens in generated_token_sequences:
-            # Get just the generated tokens (after the prompt)
-            generated_tokens = sample_tokens[prefix_length:]
-            # Decode the generated response
-            generated_text = tokenizer.decode(generated_tokens)
-            # Calculate the reward
-            reward = train_task.reward(conversation, generated_text)
-            rewards.append(reward)
+    # ||grad log P(y|x)|| wrt the token embedding, averaged over accepted samples.
+    # Mirrors em/stage_2_calc_acceptRates_grads.py, which uses embed_tokens and
+    # sums (not averages) the token log-probs before differentiating.
+    model.train()
+    emb = model.transformer.wte.weight
+    prev = emb.requires_grad
+    emb.requires_grad_(True)
+    norms = []
+    for seq in correct:
+        ids = torch.tensor(seq, dtype=torch.long, device=device)[None, :]
+        inp, tgt = ids[:, :-1], ids[:, 1:].clone()
+        tgt[:, : prefix_len - 1] = -1                      # score only the completion
+        nll = model(inp, tgt, loss_reduction='sum')
+        g, = torch.autograd.grad(nll, [emb], retain_graph=False)
+        norms.append(float(g.norm(p=2).item()))
+        model.zero_grad(set_to_none=True)
+    emb.requires_grad_(prev)
+    return p_i, float(np.mean(norms)) if norms else 0.0
 
-        # Pad the sequences so that their lengths (in time) match
-        max_length = max(len(seq) for seq in generated_token_sequences)
-        padded_generated_token_sequences = [seq + [assistant_end] * (max_length - len(seq)) for seq in generated_token_sequences]
-        padded_masks = [mask + [0] * (max_length - len(mask)) for mask in masks]
-        # Stack up the sequences and masks into PyTorch tensors
-        ids = torch.tensor(padded_generated_token_sequences, dtype=torch.long, device=device)
-        mask_ids = torch.tensor(padded_masks, dtype=torch.long, device=device)
-        # Generate autoregressive inputs and targets to the Transformer
-        inputs = ids[:, :-1]
-        targets = ids[:, 1:].clone() # clone to avoid in-place modification:
-        targets[mask_ids[:, 1:] == 0] = -1 # <-- inplace modification right here. -1 is the ignore index
-        # NOTE also that the Engine returns mask=0 for BOTH the prompt tokens AND the tool use tokens.
-        # So we will (correctly) end up not training on the prompt tokens, or the tool use forced tokens.
-        rewards = torch.tensor(rewards, dtype=torch.float, device=device)
-        # Calculate the advantages by simply subtracting the mean (instead of z-score (x-mu)/sigma)
-        mu = rewards.mean()
-        advantages = rewards - mu
-        # yield inputs/targets as (B, T) of ids and rewards as (B,) of floats
-        yield generated_token_sequences, inputs, targets, rewards, advantages
+vip_gp = None
+vip_pool = None
+if args.allocator == "vip":
+    pool_size = min(args.vip_embed_prompts, len(train_task))
+    vip_pool = np.arange(pool_size)
+    print0(f"VIP: embedding {pool_size} prompts for the GP prior...")
+    vip_gp = PromptSuccessGP(
+        prompt_embeddings(vip_pool),
+        bandwidth=args.vip_bandwidth if args.vip_bandwidth > 0 else None,
+        eps=args.vip_eps,
+        reward_range=(0.0, 1.0),      # GSM8K reward is 0/1, not -1/+1
+    )
+    print0(f"VIP: GP ready, bandwidth={vip_gp.h:.4f}")
+
+def allocate(indices, step):
+    """Return (n_per_prompt, metrics) for this step's prompts, on this rank."""
+    B = len(indices)
+    step_budget = B * args.num_samples    # exactly what uniform would spend
+    alloc_max = args.alloc_max if args.alloc_max > 0 else step_budget
+    if args.allocator == "uniform":
+        n = uniform_allocation(B, step_budget, lo=alloc_min, hi=alloc_max)
+        return n, {**allocation_stats(n), **rollout_accounting(n, 0)}
+    if args.allocator == "gvm":
+        p, G, pilot = [], [], []
+        for idx in indices:
+            pi, Gi = gvm_pilot(idx, args.gvm_pilot_samples, step)
+            p.append(pi); G.append(Gi); pilot.append(args.gvm_pilot_samples)
+        n = gvm_allocation(p, G, step_budget, alpha=args.gvm_alpha, beta=args.gvm_beta,
+                           lo=alloc_min, hi=alloc_max)
+        m = {**allocation_stats(n, p), **rollout_accounting(n, pilot),
+             "alloc/G_mean": float(np.mean(G)), "alloc/G_max": float(np.max(G))}
+        return n, m
+    # vip
+    local = np.array([int(i) % len(vip_pool) for i in indices])   # map into the GP pool
+    p_hat = vip_gp.predict(local)
+    n = vip_allocation(p_hat, step_budget, lo=max(alloc_min, 3), hi=alloc_max)
+    m = {**allocation_stats(n, p_hat), **rollout_accounting(n, 0)}
+    return n, m
+
+@torch.no_grad()
+def rollout_one(example_idx, n_rollouts, step, assistant_end):
+    """Draw n_rollouts for a single prompt and build its training tensors."""
+    conversation = train_task[int(example_idx)]
+    # Keep the <|assistant_start|> but drop the reference answer, priming a completion.
+    tokens = tokenizer.render_for_completion(conversation)
+    prefix_length = len(tokens)
+
+    model.eval()
+    seqs, masks = [], []
+    # Chunk by device_batch_size to bound memory; n_rollouts need not divide it.
+    remaining = int(n_rollouts)
+    chunk_idx = 0
+    while remaining > 0:
+        take = min(remaining, args.device_batch_size)
+        seed = hash((step, int(example_idx), chunk_idx)) & 0x7FFFFFFF
+        s_batch, m_batch = engine.generate_batch(
+            tokens, num_samples=take, max_tokens=args.max_new_tokens,
+            temperature=args.temperature, top_k=args.top_k, seed=seed,
+        )
+        seqs.extend(s_batch); masks.extend(m_batch)
+        remaining -= take; chunk_idx += 1
+
+    rewards = [train_task.reward(conversation, tokenizer.decode(s[prefix_length:])) for s in seqs]
+
+    max_length = max(len(s) for s in seqs)
+    padded = [s + [assistant_end] * (max_length - len(s)) for s in seqs]
+    padded_masks = [m + [0] * (max_length - len(m)) for m in masks]
+    ids = torch.tensor(padded, dtype=torch.long, device=device)
+    mask_ids = torch.tensor(padded_masks, dtype=torch.long, device=device)
+    inputs = ids[:, :-1]
+    targets = ids[:, 1:].clone()
+    targets[mask_ids[:, 1:] == 0] = -1   # -1 is the ignore index
+    rewards_t = torch.tensor(rewards, dtype=torch.float, device=device)
+    # Dr. GRPO style: subtract the mean, no std normalisation.
+    advantages = rewards_t - rewards_t.mean()
+    return {
+        "idx": int(example_idx),
+        "sequences": seqs,
+        "inputs": inputs,
+        "targets": targets,
+        "rewards": rewards_t,
+        "advantages": advantages,
+        # Realised accept rate, needed both for the inv_np estimator and to tell
+        # whether the allocator had any signal to work with.
+        "p_hat": float(rewards_t.mean().item()),
+        "n": int(n_rollouts),
+    }
+
+@torch.no_grad()
+def get_step_batches():
+    """Yield one whole step at a time: allocation is a batch-level decision."""
+    assistant_end = tokenizer.encode_special("<|assistant_end|>")
+    rank_indices = list(range(ddp_rank, len(train_task), ddp_world_size))
+    cycler = itertools.cycle(rank_indices)
+    step = 0
+    while True:
+        indices = [next(cycler) for _ in range(examples_per_rank)]
+        n_alloc, alloc_metrics = allocate(indices, step)
+        records = []
+        for example_idx, n_i in zip(indices, n_alloc):
+            # GVM legitimately assigns zero to prompts it judges uninformative;
+            # such a prompt contributes nothing and is simply skipped.
+            if int(n_i) <= 0:
+                continue
+            records.append(rollout_one(example_idx, n_i, step, assistant_end))
+        alloc_metrics["alloc/prompts_used"] = float(len(records))
+        alloc_metrics["alloc/prompts_skipped"] = float(len(indices) - len(records))
+        yield records, alloc_metrics
+        step += 1
 
 # -----------------------------------------------------------------------------
 # Simple evaluation loop for GSM8K pass@k
@@ -218,7 +366,7 @@ examples_per_rank = args.examples_per_step // ddp_world_size # per GPU
 print0(f"Calculated examples per rank: {examples_per_rank}")
 
 # Kick off the training loop
-batch_iterator = get_batch()
+batch_iterator = get_step_batches()
 for step in range(num_steps):
 
     # Evaluate the model once in a while and log to wandb
@@ -242,43 +390,82 @@ for step in range(num_steps):
             **log_passk,
         })
 
-    # Forward/Backward on rollouts over multiple examples in the dataset
+    # Forward/Backward on rollouts. One step = one allocation decision over
+    # `examples_per_rank` prompts, then n_i rollouts for each of them.
     rewards_list = []
     sequence_lengths = []
-    for example_step in range(examples_per_rank):
-        # Get one batch corresponding to one example in the training dataset
-        sequences_all, inputs_all, targets_all, rewards_all, advantages_all = next(batch_iterator)
-        # Evaluate the loss and gradients
-        model.train() # ensure the model is in train mode
-        # We need one more loop because we can never exceed the device_batch_size
-        assert inputs_all.size(0) % args.device_batch_size == 0
-        num_passes = inputs_all.size(0) // args.device_batch_size
+    records, alloc_metrics = next(batch_iterator)
+
+    # How each prompt's contribution is weighted. This is the knob the GVM
+    # analysis turns on: the theory (Alg.1 line 8 / Lemma 1) wants equal weight
+    # per prompt, while a global token-mean -- what verl does -- lets a prompt's
+    # weight grow with the rollouts it was allocated, which is exactly the set
+    # GVM deliberately oversamples.
+    total_valid = None
+    if args.estimator_weight == "per_token":
+        total_valid = sum(int((r["targets"] >= 0).sum().item()) for r in records)
+        total_valid = max(total_valid, 1)
+    inv_np = {}
+    if args.estimator_weight == "inv_np":
+        for r in records:
+            # E[accepted] = n_i * p_i; guard the p_i = 0 case, which contributes
+            # no gradient anyway since every advantage in that group is zero.
+            denom = r["n"] * max(r["p_hat"], 1e-6)
+            inv_np[r["idx"]] = 1.0 / denom
+
+    n_prompts = max(len(records), 1)
+    for example_step, rec in enumerate(records):
+        inputs_all, targets_all = rec["inputs"], rec["targets"]
+        rewards_all, advantages_all = rec["rewards"], rec["advantages"]
+        model.train()
+        # n_i need not divide device_batch_size, so the last pass may be ragged.
+        total_rows = inputs_all.size(0)
+        num_passes = (total_rows + args.device_batch_size - 1) // args.device_batch_size
         for pass_idx in range(num_passes):
-            # Pluck out the batch for this pass
-            b0, b1 = pass_idx * args.device_batch_size, (pass_idx + 1) * args.device_batch_size
-            inputs = inputs_all[b0:b1]
-            targets = targets_all[b0:b1]
-            rewards = rewards_all[b0:b1]
-            advantages = advantages_all[b0:b1]
-            # Calculate log probabilities. Note that the loss calculates NLL = -logp, so we negate
-            logp = -model(inputs, targets, loss_reduction='none').view_as(inputs) # (B, T)
-            # Calculate the PG objective. Note that ignore_index=-1 ensures that invalid tokens have loss 0.
+            b0 = pass_idx * args.device_batch_size
+            b1 = min(b0 + args.device_batch_size, total_rows)
+            inputs, targets = inputs_all[b0:b1], targets_all[b0:b1]
+            rewards, advantages = rewards_all[b0:b1], advantages_all[b0:b1]
+            logp = -model(inputs, targets, loss_reduction='none').view_as(inputs)  # (B, T)
             pg_obj = (logp * advantages.unsqueeze(-1)).sum()
-            # normalize by the number of valid tokens, number of passes, and examples_per_rank
-            num_valid = (targets >= 0).sum().clamp(min=1)
-            pg_obj = pg_obj / (num_valid * num_passes * examples_per_rank)
-            # Note, there is no need to add PPO ratio+clip because we are on policy
-            # Finally, formulate the loss that we want to minimize (instead of objective we wish to maximize)
+            if args.estimator_weight == "per_token":
+                # One global token-mean across the whole step.
+                pg_obj = pg_obj / total_valid
+            elif args.estimator_weight == "inv_np":
+                # Lemma 1's unbiased estimator, averaged over prompts.
+                pg_obj = pg_obj * (inv_np[rec["idx"]] / n_prompts)
+            else:  # per_prompt (nanochat's original behaviour)
+                num_valid = (targets >= 0).sum().clamp(min=1)
+                pg_obj = pg_obj / (num_valid * num_passes * n_prompts)
+            # On-policy, so no PPO ratio/clip is needed.
             loss = -pg_obj
             loss.backward()
-            print0(f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss: {loss.item():.6f} | Average reward: {rewards.mean().item()}")
-        # For logging
+        print0(f"Step {step}/{num_steps} | prompt {example_step} (idx {rec['idx']}) | "
+               f"n={rec['n']} p={rec['p_hat']:.3f} | reward {rewards_all.mean().item():.3f}")
         rewards_list.append(rewards_all.mean().item())
-        sequence_lengths.extend(len(seq) for seq in sequences_all)
+        sequence_lengths.extend(len(seq) for seq in rec["sequences"])
 
-    # A bunch of logging for how the rollouts went this step
-    mean_reward = sum(rewards_list) / len(rewards_list)
-    mean_sequence_length = sum(sequence_lengths) / len(sequence_lengths)
+    # VIP's GP learns from the rollouts we were drawing anyway -- no extra cost.
+    # Calibration is logged BEFORE the update, so it scores a genuine prediction
+    # rather than the value just fitted to.
+    if vip_gp is not None and records:
+        local = np.array([r["idx"] % len(vip_pool) for r in records])
+        realised = np.array([r["p_hat"] for r in records])
+        alloc_metrics.update(vip_gp.calibration(local, realised))
+        vip_gp.update(local, realised)
+
+    # A bunch of logging for how the rollouts went this step.
+    # A rank can legitimately end up with nothing: GVM assigns zero budget to
+    # prompts it judges uninformative, and a whole batch can be unsolvable. Do
+    # NOT `continue` here -- the collectives below are collective, so one rank
+    # bailing would desync the all_reduce, and skipping past optimizer.step()
+    # would also skip the zero_grad that follows it. Contributing zero gradient
+    # is the correct behaviour and happens naturally.
+    empty_rank = not rewards_list
+    if empty_rank:
+        print0(f"Step {step}/{num_steps} | no prompt received budget on this rank")
+    mean_reward = sum(rewards_list) / len(rewards_list) if rewards_list else 0.0
+    mean_sequence_length = (sum(sequence_lengths) / len(sequence_lengths)) if sequence_lengths else 0.0
     if ddp: # aggregate across ranks
         mean_reward_tensor = torch.tensor(mean_reward, dtype=torch.float, device=device)
         mean_sequence_length_tensor = torch.tensor(mean_sequence_length, dtype=torch.float, device=device)
@@ -291,6 +478,9 @@ for step in range(num_steps):
         "step": step,
         "reward": mean_reward,
         "sequence_length": mean_sequence_length,
+        "allocator": args.allocator,
+        "empty_rank": float(empty_rank),
+        **alloc_metrics,
     })
 
     # Update the model parameters
