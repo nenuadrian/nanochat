@@ -10,10 +10,11 @@ torchrun --nproc_per_node=8 -m scripts.chat_eval -- -i sft -a ARC-Easy
 
 import argparse
 from functools import partial
+import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type
+from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type, DummyWandb
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
 
@@ -190,10 +191,17 @@ if __name__ == "__main__":
     parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
     parser.add_argument('-x', '--max-problems', type=int, default=None, help='Max problems to evaluate')
     parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
+    parser.add_argument('--run', type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
     args = parser.parse_args()
+    user_config = vars(args).copy()  # for logging
 
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+    master_process = ddp_rank == 0
+
+    # wandb logging init
+    use_dummy_wandb = args.run == "dummy" or not master_process
+    wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-eval", name=args.run, config=user_config)
 
     model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
     engine = Engine(model, tokenizer)
@@ -236,5 +244,13 @@ if __name__ == "__main__":
             centered_mean += centered_acc
         chatcore_metric = centered_mean / len(results)
         print0(f"ChatCORE metric: {chatcore_metric:.4f}")
+
+    # Log every task in a single step so the metrics line up on one x value.
+    # Accuracies are already all-reduced across ranks inside the eval loops.
+    log_data = {f"eval/{task_name}": acc for task_name, acc in results.items()}
+    if all_tasks_were_evaluated:
+        log_data["eval/chatcore"] = chatcore_metric
+    wandb_run.log(log_data)
+    wandb_run.finish()
 
     compute_cleanup()

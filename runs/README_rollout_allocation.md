@@ -49,30 +49,79 @@ python -m scripts.tok_eval
 
 `speedrun.sh` is written for 8xH100. On an iMac use the CPU/MPS shape below.
 
-**On depth.** Memory is not the constraint — even d26 needs only ~17 GB. Compute
-is. nanochat trains compute-optimal (`tokens = params x 10.5`), so FLOPs grow as
-`63 x params^2`:
+**On depth.** All numbers below are measured on an M4 Pro (16-core GPU, 64 GB),
+fp32, `seq=512`, `device-batch-size=32`. Memory is never the constraint — d20
+needs ~3 GB of weights+optimizer. Two things bind instead.
 
-| depth | params | opt. tokens | hrs @3 TFLOPS | hrs @10 TFLOPS |
-|------:|-------:|------------:|--------------:|---------------:|
-| 6     | 74M    | 0.8B        | 31            | 9.5            |
-| 8     | 126M   | 1.3B        | 92            | 28             |
-| 12    | 286M   | 3.0B        | 478           | 143            |
-| 20    | 896M   | 9.4B        | 4688          | 1407           |
+**(a) Training is a flat ~3.6 TFLOPS** regardless of shape or batch size, so
+pretraining time is just `tokens / (3.6e12 / flops_per_token)`. Note the horizon
+is `12 x scaling_params`, and `scaling_params` is `transformer_matrices +
+lm_head` (`base_train.py:276`) — *not* total params, which is 3x larger because
+it counts the embedding tables. Using total params overestimates the run by ~10x.
 
-Measure your own throughput before committing to a size — run 20 iterations,
-read tok/s, and multiply by `6 x params`:
+**(b) Decode falls off a cliff above `model_dim=512`** — and RL is decode-bound,
+so this dominates sections 4-6:
+
+| model_dim | 384 | 512 | 576 | 640 | 768 |
+|---|---:|---:|---:|---:|---:|
+| decode tok/s (batch 16) | 1965 | 1738 | 494 | 439 | 424 |
+
+A 3.5x drop between 512 and 576, with no matching drop in training throughput.
+So **pin `model_dim` to 512 and buy capacity with depth instead**, via
+`--aspect-ratio` (`model_dim = ceil(depth x aspect / 64) x 64`). A d16 at
+dim=512 has *more* params than a d10 at dim=640 and decodes 2.2x faster.
+
+End-to-end cost, including SFT and all six RL runs of section 6 on
+`arc-challenge` (69 steps/run):
+
+| config | `--depth/--aspect-ratio` | params | pretrain | 1 RL run | **total** |
+|---|---|---:|---:|---:|---:|
+| d6  (below)    | `6` / `64`  |  74M |  3.2h | 0.9h | **9h**  |
+| **d8**         | `8` / `64`  | 126M | 10.4h | 1.1h | **17h** |
+| **d12 narrow** | `12` / `42` | 172M | 17.9h | 1.5h | **28h** |
+| d16 narrow     | `16` / `32` | 218M | 29.1h | 1.9h | **41h** |
+| d20 narrow     | `20` / `25` | 264M | 42.2h | 2.3h | **57h** |
+| d10 std        | `10` / `64` | 196M | 30.0h | 4.1h | **55h** |
+| d12 std        | `12` / `64` | 286M | 74.9h | 4.3h | **102h** |
+| d20 std        | `20` / `64` | 897M | 1107h | 7.8h | **46 days** |
+
+The three `std` rows are the trap: d12-std costs 3.7x what d12-narrow costs and
+is worse on every axis that matters here. d20-std is 46 days and simply out of
+reach — if you want d20, you want `--aspect-ratio=25`.
+
+**d8 is the recommended target** (~17h end to end, fits a day). **d12 at
+`--aspect-ratio=42` is the stretch** (~28h) if you want the extra capability for
+section 5. Anything with `model_dim > 512` is not worth it on this hardware.
+
+`NANOCHAT_DTYPE=bfloat16` buys 17-22% on *training* with an identical loss
+curve, but costs 33% on *decode* (d20 narrow: 796 -> 533 tok/s), so set it for
+sections 2-3 and unset it for sections 4-6. It does not move the decode cliff.
+d20 narrow with a bf16 pretrain is ~50h end to end rather than 57h.
+
+Re-measure before committing — run 20 iterations and read `tok/sec`:
 
 ```bash
-python -m scripts.base_train --depth=6 --head-dim=64 --window-pattern=L \
+python -m scripts.base_train --depth=8 --head-dim=64 --window-pattern=L \
     --max-seq-len=512 --device-batch-size=32 --total-batch-size=16384 \
-    --num-iterations=20 --core-metric-every=-1 --run=dummy
+    --num-iterations=20 --eval-every=-1 --core-metric-every=-1 --run=dummy
 ```
 
-**depth 6 is the realistic target on an iMac.** The `--num-iterations=5000`
-setting below is deliberately ~10x undertrained relative to compute-optimal,
-which is the right trade here: see section 5, capability is not what this
-experiment is measuring.
+Then pretrain. Omitting `--num-iterations` lets the script pick the
+compute-optimal horizon itself (`12 x scaling_params`), which is what the
+`pretrain` column above costs:
+
+```bash
+python -m scripts.base_train \
+    --depth=8 --head-dim=64 --window-pattern=L \
+    --max-seq-len=512 --device-batch-size=32 --total-batch-size=16384 \
+    --eval-every=100 --core-metric-every=-1 \
+    --run=base
+```
+
+If you want a result tonight rather than tomorrow, the d6 run is the fallback.
+At `--num-iterations=5000` it is ~3.4x undertrained (82M tokens vs 278M
+compute-optimal), which is a deliberate trade: see section 5, capability is not
+what this experiment is measuring.
 
 ```bash
 python -m scripts.base_train \
