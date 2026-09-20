@@ -189,8 +189,10 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     BOS-aligned dataloader for SFT with bestfit-pad packing.
 
     Each row in the batch starts with BOS (beginning of a conversation).
-    Conversations are packed using best-fit algorithm. When no conversation fits,
-    the row is padded (instead of cropping) to ensure no tokens are ever discarded.
+    Conversations are packed using best-fit algorithm. When no conversation fits the
+    leftover space in a partially filled row, the row is padded (instead of cropping) so
+    conversations are never split across rows. A conversation longer than row_capacity
+    fits nowhere, so it is truncated to row_capacity in a row of its own.
     Padding positions have targets masked with -1 (ignore_index for cross-entropy).
     """
     global last_step, approx_progress, current_epoch
@@ -250,9 +252,21 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                     row.extend(conv)
                     mask_row.extend(conv_mask)
                     consumed += ddp_world_size  # Track actual consumption
+                elif not row:
+                    # Nothing fits in an *empty* row => every conversation in the buffer is
+                    # longer than row_capacity and can never fit. Leaving them in the buffer
+                    # clogs it permanently (the buffer stops refilling, every row comes out
+                    # pure padding, and the loss becomes NaN), so truncate the shortest one
+                    # to row_capacity and consume it. This is the only lossy path and it only
+                    # triggers for conversations that do not fit the context window at all.
+                    shortest_idx = min(range(len(conv_buffer)), key=lambda i: len(conv_buffer[i]))
+                    conv, conv_mask = conv_buffer.pop(shortest_idx)
+                    row.extend(conv[:remaining])
+                    mask_row.extend(conv_mask[:remaining])
+                    consumed += ddp_world_size  # Track actual consumption
                 else:
-                    # No conversation fits - pad the remainder instead of cropping
-                    # This ensures we never discard any tokens
+                    # No conversation fits the leftover space - pad the remainder instead of
+                    # cropping, so we don't split a conversation across rows
                     content_len = len(row)
                     row.extend([bos_token] * remaining)  # Pad with BOS tokens
                     mask_row.extend([0] * remaining)
@@ -267,16 +281,29 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
             rows.append(row[:row_capacity])
             mask_rows.append(mask_row[:row_capacity])
 
-        # Stopping condition to respect num_iterations, if given
+        # A micro-batch with no supervised targets at all would make the mean-reduced
+        # cross entropy return NaN (0 valid terms), which then poisons every weight via
+        # the backward pass. The truncation path above makes this unreachable; keep the
+        # check as a cheap guard so a packing change can never silently NaN a run.
+        if not any(any(mask_row[1:row_capacity]) for mask_row in mask_rows):
+            continue
+
+        # Stopping condition to respect num_iterations, if given.
+        # `it` counts micro-batches; the training loop consumes grad_accum_steps of them per
+        # optimizer step, plus one prefetched before the loop, so after N optimizer steps
+        # it == N * grad_accum_steps + 1. Convert to optimizer steps so that --num-iterations
+        # means what it says (it used to stop after num_iterations micro-batches, i.e.
+        # grad_accum_steps times too early).
         it += 1
-        if 0 < args.num_iterations <= it and split == "train":
+        steps_done = (it - 1) // grad_accum_steps
+        if 0 < args.num_iterations <= steps_done and split == "train":
             last_step = True
 
         # Update progress tracking (based on consumed, not cursor, to account for buffering)
         if split == "train":
             current_epoch = epoch
             if args.num_iterations > 0:
-                approx_progress = it / args.num_iterations
+                approx_progress = steps_done / args.num_iterations
             else:
                 approx_progress = consumed / dataset_size
             # Trigger last_step when we've consumed enough (instead of when cursor wraps)
@@ -300,7 +327,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         # For each row, positions >= (content_length - 1) in targets should be masked
         for i, content_len in enumerate(row_lengths):
             if content_len < row_capacity:
-                targets[i, content_len-1:] = -1
+                targets[i, max(content_len - 1, 0):] = -1
 
         yield inputs, targets
 
@@ -312,6 +339,7 @@ progress = 0 # will go from 0 to 1 over the course of the epoch
 # Same shape as base_train but uses progress (0→1) instead of absolute step counts,
 # because SFT doesn't always know num_iterations in advance (dataset-driven stopping).
 def get_lr_multiplier(progress):
+    progress = min(progress, 1.0) # progress can overshoot 1.0; never let warmdown flip the LR negative
     if progress < args.warmup_ratio:
         return (progress + 1e-8) / args.warmup_ratio
     elif progress <= 1.0 - args.warmdown_ratio:
