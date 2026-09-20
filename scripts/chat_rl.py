@@ -9,6 +9,13 @@ simpler and more similar to just REINFORCE:
 3) We use DAPO style normalization that is token-level, not sequence-level.
 4) Instead of z-score normalization (r - mu)/sigma, only use (r - mu) as the advantage.
 
+--objective tpo swaps that policy gradient for Target Policy Optimization
+(arXiv:2604.06159): instead of weighting each completion's log-prob by a scalar
+advantage, build the distribution you want over the group,
+q ∝ p_old * exp(zscore(r)), and fit the policy to it by cross-entropy. See
+nanochat/tpo.py. The rollouts, the allocators and everything else are shared, so
+--objective is a clean A/B on the loss alone.
+
 1 GPU:
 python -m scripts.chat_rl
 
@@ -33,6 +40,7 @@ from nanochat.allocation import (
     allocation_stats, rollout_accounting,
 )
 from nanochat.vip_gp import PromptSuccessGP
+from nanochat.tpo import tpo_weights
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -98,8 +106,30 @@ parser.add_argument("--estimator-weight", type=str, default="per_prompt",
                     help="per_prompt: equal weight per prompt (GVM Alg.1 line 8, nanochat default); "
                          "per_token: global token-mean, so weight grows with n_i (what verl does); "
                          "inv_np: explicit 1/(n_i p_i) weighting from GVM Lemma 1")
+# Which loss turns the scored rollouts into a gradient
+parser.add_argument("--objective", type=str, default="grpo", choices=["grpo", "tpo"],
+                    help="grpo: mean-subtracted policy gradient (what nanochat shipped with); "
+                         "tpo: Target Policy Optimization, arXiv:2604.06159, cross-entropy to "
+                         "q ∝ p_old * exp(zscore(r)) over the group")
+parser.add_argument("--tpo-eta", type=float, default=1.0,
+                    help="TPO target temperature. 1.0 is the paper default and robust over ~[0.25, 2]")
+parser.add_argument("--tpo-anchor", type=int, default=1,
+                    help="keep the p_old anchor in the target; 0 gives the q ∝ exp(u) ablation")
+parser.add_argument("--tpo-logp", type=str, default="sum", choices=["sum", "mean"],
+                    help="how a completion's sequence log-prob enters the group softmax. "
+                         "'sum' is the paper's objective; 'mean' divides by the completion length, "
+                         "which stops long completions collapsing the group softmax onto whichever "
+                         "sample was shortest (watch tpo/p_max to see whether you need it)")
+parser.add_argument("--tpo-epochs", type=int, default=1,
+                    help="gradient epochs over each rollout batch. TPO's frozen target is a fixed "
+                         "point, so reuse needs no PPO ratio or clip (paper 5.3); the paper reports "
+                         "4 epochs converging ~5x earlier. Only valid with --objective tpo")
 parser.add_argument("--save-every", type=int, default=60, help="save checkpoint every N steps")
 args = parser.parse_args()
+if args.objective != "tpo":
+    assert args.tpo_epochs == 1, "--tpo-epochs > 1 needs --objective tpo: the grpo path here has no " \
+        "PPO ratio or clip, so reusing a rollout batch for it would be uncorrected off-policy"
+assert args.tpo_epochs >= 1
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
 
@@ -129,6 +159,12 @@ else:
 print0(f"Task: {args.task} | train {len(train_task)} | val {len(val_task)}")
 num_steps = (len(train_task) // args.examples_per_step) * args.num_epochs
 print0(f"Calculated number of steps: {num_steps}")
+print0(f"Objective: {args.objective}"
+       + (f" (eta={args.tpo_eta}, anchor={bool(args.tpo_anchor)}, logp={args.tpo_logp}, "
+          f"epochs={args.tpo_epochs})" if args.objective == "tpo" else ""))
+if args.objective == "tpo" and args.estimator_weight != "per_prompt":
+    print0(f"NOTE: --estimator-weight={args.estimator_weight} is ignored under --objective tpo, "
+           "which uses the paper's normalisation (sum over candidates, mean over prompts).")
 
 # -----------------------------------------------------------------------------
 # Allocation machinery: pilot rollouts for GVM, a GP for VIP.
@@ -249,6 +285,49 @@ def allocate(indices, step):
     m = {**allocation_stats(n, p_hat), **rollout_accounting(n, 0)}
     return n, m
 
+# How many rows went through the extra scoring forward TPO needs, tracked for the
+# same reason rollout_accounting tracks GVM's pilot rollouts: it is real compute
+# the rollout budget does not account for (~1 extra forward per rollout).
+tpo_forward_rows = 0
+
+@torch.no_grad()   # also reached from the multi-epoch refresh, which is NOT no_grad
+def sequence_logprobs(inputs, targets):
+    """Sum of log pi_theta(y_t | ...) over the scored tokens, one scalar per row.
+
+    This is ell in nanochat/tpo.py. It deliberately re-runs the training forward
+    rather than reusing the sampler's logits: the Engine samples with a KV cache
+    and applies temperature/top-k, so its probabilities are not pi_theta, and any
+    drift between the two would show up as a wrong p_old rather than as an error.
+    """
+    global tpo_forward_rows
+    model.train()   # the mode whose gradient we later take; no dropout either way
+    out = []
+    for b0 in range(0, inputs.size(0), args.device_batch_size):
+        inp = inputs[b0:b0 + args.device_batch_size]
+        tgt = targets[b0:b0 + args.device_batch_size]
+        # cross_entropy(reduction='none') is exactly 0 at ignore_index positions,
+        # so summing over T already restricts to the completion.
+        nll = model(inp, tgt, loss_reduction='none').view_as(inp)
+        out.append(-nll.sum(dim=-1))
+    tpo_forward_rows += int(inputs.size(0))
+    return torch.cat(out)
+
+def tpo_coefficients(inputs, targets, rewards, target=None):
+    """(coef, q, diagnostics) for one group, ready to multiply a row's log-prob sum.
+
+    With --tpo-logp mean the group softmax is taken over length-normalised
+    sequence log-probs, so the same 1/T factor has to ride along on the
+    coefficient for the surrogate to keep matching the objective.
+    """
+    ell = sequence_logprobs(inputs, targets)
+    if args.tpo_logp == "mean":
+        scale = 1.0 / (targets >= 0).sum(dim=-1).clamp(min=1).float()
+    else:
+        scale = torch.ones_like(ell)
+    w, q, diag = tpo_weights(ell * scale, rewards, eta=args.tpo_eta,
+                             anchor=bool(args.tpo_anchor), target=target)
+    return w * scale, q, diag
+
 @torch.no_grad()
 def rollout_one(example_idx, n_rollouts, step, assistant_end):
     """Draw n_rollouts for a single prompt and build its training tensors."""
@@ -285,6 +364,12 @@ def rollout_one(example_idx, n_rollouts, step, assistant_end):
     rewards_t = torch.tensor(rewards, dtype=torch.float, device=device)
     # Dr. GRPO style: subtract the mean, no std normalisation.
     advantages = rewards_t - rewards_t.mean()
+    # TPO replaces that scalar advantage with w = q - p^theta (see nanochat/tpo.py).
+    # Both are computed regardless so the reward/advantage logging is identical
+    # across objectives; only one of them is read by the training loop.
+    tpo_coef, tpo_q, tpo_diag = (None, None, {})
+    if args.objective == "tpo":
+        tpo_coef, tpo_q, tpo_diag = tpo_coefficients(inputs, targets, rewards_t)
     return {
         "idx": int(example_idx),
         "sequences": seqs,
@@ -296,6 +381,9 @@ def rollout_one(example_idx, n_rollouts, step, assistant_end):
         # whether the allocator had any signal to work with.
         "p_hat": float(rewards_t.mean().item()),
         "n": int(n_rollouts),
+        "tpo_coef": tpo_coef,
+        "tpo_q": tpo_q,
+        "tpo_diag": tpo_diag,
     }
 
 @torch.no_grad()
@@ -332,6 +420,23 @@ def get_step_batches():
                 "realised/p_frac_degenerate": float(((ps <= 0) | (ps >= 1)).mean()),
                 "realised/rollouts_wasted": float(
                     sum(r["n"] for r in records if r["p_hat"] <= 0 or r["p_hat"] >= 1)),
+            })
+        # TPO health. p_max is the one to watch: the group softmax is taken over
+        # SUMS of token log-probs, so on long completions it can collapse onto a
+        # single sample, leaving q ~ p_old and nothing to redistribute however the
+        # rewards fell. weight_l1 = sum|q - p| is the size of the redistribution
+        # actually requested, so tpo/frac_inactive counts the groups TPO no-oped
+        # on -- which SHOULD include every degenerate group and ideally little else.
+        if records and args.objective == "tpo":
+            d = [r["tpo_diag"] for r in records]
+            l1 = np.array([x["weight_l1"] for x in d])
+            pm = np.array([x["p_max"] for x in d])
+            alloc_metrics.update({
+                "tpo/p_max_mean": float(pm.mean()),
+                "tpo/p_max_max": float(pm.max()),
+                "tpo/p_entropy_mean": float(np.mean([x["p_entropy"] for x in d])),
+                "tpo/weight_l1_mean": float(l1.mean()),
+                "tpo/frac_inactive": float((l1 < 1e-6).mean()),
             })
         yield records, alloc_metrics
         step += 1
@@ -437,6 +542,7 @@ for step in range(num_steps):
     # `examples_per_rank` prompts, then n_i rollouts for each of them.
     rewards_list = []
     sequence_lengths = []
+    rows_before = tpo_forward_rows
     records, alloc_metrics = next(batch_iterator)
 
     # How each prompt's contribution is weighted. This is the knob the GVM
@@ -466,36 +572,67 @@ for step in range(num_steps):
             inv_np[k] = raw[k] / mass
 
     n_prompts = max(len(records), 1)
-    for example_step, rec in enumerate(records):
-        inputs_all, targets_all = rec["inputs"], rec["targets"]
-        rewards_all, advantages_all = rec["rewards"], rec["advantages"]
-        model.train()
-        # n_i need not divide device_batch_size, so the last pass may be ragged.
-        total_rows = inputs_all.size(0)
-        num_passes = (total_rows + args.device_batch_size - 1) // args.device_batch_size
-        for pass_idx in range(num_passes):
-            b0 = pass_idx * args.device_batch_size
-            b1 = min(b0 + args.device_batch_size, total_rows)
-            inputs, targets = inputs_all[b0:b1], targets_all[b0:b1]
-            rewards, advantages = rewards_all[b0:b1], advantages_all[b0:b1]
-            logp = -model(inputs, targets, loss_reduction='none').view_as(inputs)  # (B, T)
-            pg_obj = (logp * advantages.unsqueeze(-1)).sum()
-            if args.estimator_weight == "per_token":
-                # One global token-mean across the whole step.
-                pg_obj = pg_obj / total_valid
-            elif args.estimator_weight == "inv_np":
-                # Lemma 1's unbiased estimator, averaged over prompts.
-                pg_obj = pg_obj * inv_np[example_step]
-            else:  # per_prompt (nanochat's original behaviour)
-                num_valid = (targets >= 0).sum().clamp(min=1)
-                pg_obj = pg_obj / (num_valid * num_passes * n_prompts)
-            # On-policy, so no PPO ratio/clip is needed.
-            loss = -pg_obj
-            loss.backward()
-        print0(f"Step {step}/{num_steps} | prompt {example_step} (idx {rec['idx']}) | "
-               f"n={rec['n']} p={rec['p_hat']:.3f} | reward {rewards_all.mean().item():.3f}")
-        rewards_list.append(rewards_all.mean().item())
-        sequence_lengths.extend(len(seq) for seq in rec["sequences"])
+    # TPO's target is a fixed point of its own update, so a rollout batch can be
+    # reused for more gradient epochs with no PPO ratio and no clip: q stays
+    # frozen at what the rollout policy saw and only p^theta is recomputed
+    # (paper sections 2 and 5.3). The grpo path has no such correction, which is
+    # why --tpo-epochs is rejected for it. With tpo_epochs=1 this loop runs once
+    # and the update below is exactly what it was before.
+    lrm = get_lr_multiplier(step)
+    for inner_epoch in range(args.tpo_epochs):
+        if inner_epoch > 0:
+            # theta moved on the previous epoch, so p^theta -- and with it the
+            # coefficient w = q - p^theta -- is stale and has to be remeasured.
+            for rec in records:
+                rec["tpo_coef"], _, rec["tpo_diag"] = tpo_coefficients(
+                    rec["inputs"], rec["targets"], rec["rewards"], target=rec["tpo_q"])
+        for example_step, rec in enumerate(records):
+            inputs_all, targets_all = rec["inputs"], rec["targets"]
+            rewards_all, advantages_all = rec["rewards"], rec["advantages"]
+            model.train()
+            # n_i need not divide device_batch_size, so the last pass may be ragged.
+            total_rows = inputs_all.size(0)
+            num_passes = (total_rows + args.device_batch_size - 1) // args.device_batch_size
+            for pass_idx in range(num_passes):
+                b0 = pass_idx * args.device_batch_size
+                b1 = min(b0 + args.device_batch_size, total_rows)
+                inputs, targets = inputs_all[b0:b1], targets_all[b0:b1]
+                logp = -model(inputs, targets, loss_reduction='none').view_as(inputs)  # (B, T)
+                if args.objective == "tpo":
+                    # Surrogate for -sum_i q_i log p_i^theta. Its gradient wrt a
+                    # sequence log-prob is exactly p_i^theta - q_i, so the group
+                    # can be split across passes even though one softmax couples
+                    # it. Normalisation is the paper's -- sum over candidates,
+                    # mean over prompts -- so there is no token division here and
+                    # --estimator-weight does not apply.
+                    obj = (logp.sum(dim=-1) * rec["tpo_coef"][b0:b1]).sum() / n_prompts
+                else:
+                    advantages = advantages_all[b0:b1]
+                    obj = (logp * advantages.unsqueeze(-1)).sum()
+                    if args.estimator_weight == "per_token":
+                        # One global token-mean across the whole step.
+                        obj = obj / total_valid
+                    elif args.estimator_weight == "inv_np":
+                        # Lemma 1's unbiased estimator, averaged over prompts.
+                        obj = obj * inv_np[example_step]
+                    else:  # per_prompt (nanochat's original behaviour)
+                        num_valid = (targets >= 0).sum().clamp(min=1)
+                        obj = obj / (num_valid * num_passes * n_prompts)
+                # On-policy, so no PPO ratio/clip is needed.
+                loss = -obj
+                loss.backward()
+            if inner_epoch == 0:
+                print0(f"Step {step}/{num_steps} | prompt {example_step} (idx {rec['idx']}) | "
+                       f"n={rec['n']} p={rec['p_hat']:.3f} | reward {rewards_all.mean().item():.3f}")
+                rewards_list.append(rewards_all.mean().item())
+                sequence_lengths.extend(len(seq) for seq in rec["sequences"])
+        # Update the model parameters. Every rank runs this the same number of
+        # times per step -- the optimizer all-reduces gradients inside step(), so
+        # a rank that skipped one would hang the others.
+        for group in optimizer.param_groups:
+            group["lr"] = group["initial_lr"] * lrm
+        optimizer.step()
+        model.zero_grad(set_to_none=True)
 
     # VIP's GP learns from the rollouts we were drawing anyway -- no extra cost.
     # Calibration is logged BEFORE the update, so it scores a genuine prediction
@@ -531,16 +668,16 @@ for step in range(num_steps):
         "reward": mean_reward,
         "sequence_length": mean_sequence_length,
         "allocator": args.allocator,
+        "objective": args.objective,
         "empty_rank": float(empty_rank),
+        # Rows pushed through the extra no-grad forward TPO needs to read p^old
+        # (and p^theta again on every extra gradient epoch). Roughly one extra
+        # forward per rollout per epoch, and not charged to the rollout budget --
+        # same reason rollout_accounting exists for GVM's pilot pass.
+        "tpo/scoring_rows": float(tpo_forward_rows - rows_before),
         **alloc_metrics,
     })
 
-    # Update the model parameters
-    lrm = get_lr_multiplier(step)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-    optimizer.step()
-    model.zero_grad(set_to_none=True)
     wandb_run.log({
         "step": step,
         "lrm": lrm,
