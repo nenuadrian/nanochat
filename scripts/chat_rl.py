@@ -27,6 +27,7 @@ import argparse
 import os
 import time
 import itertools
+import json
 import wandb
 import numpy as np
 import torch
@@ -75,6 +76,9 @@ parser.add_argument("--num-samples", type=int, default=16, help="number of sampl
 # Generation
 parser.add_argument("--max-new-tokens", type=int, default=None,
                     help="max tokens to generate per sample (default: task-dependent, see below)")
+# Rollout dumping for RAFT
+parser.add_argument("--dump-rollouts", action="store_true", help="dump generated rollouts to disk for RAFT selection (JSONL)")
+parser.add_argument("--dump-rollouts-dir", type=str, default=None, help="override base dir for dumped rollouts (default: <base>/raft_data/<run>)")
 parser.add_argument("--temperature", type=float, default=1.0, help="sampling temperature")
 parser.add_argument("--top-k", type=int, default=50, help="top-k sampling (0 = disabled)")
 # Optimization
@@ -462,6 +466,29 @@ def rollout_one(example_idx, n_rollouts, step, assistant_end):
         remaining -= take; chunk_idx += 1
 
     rewards = [train_task.reward(conversation, tokenizer.decode(s[prefix_length:])) for s in seqs]
+
+    # Optional: dump rollouts for RAFT post-processing. Each line is a JSON object
+    # with prompt id, prompt tokens, sequence tokens, reward, seed info and step.
+    if args.dump_rollouts:
+        base = args.dump_rollouts_dir or os.path.join(get_base_dir(), "raft_data", args.run)
+        os.makedirs(os.path.join(base, str(step)), exist_ok=True)
+        fname = os.path.join(base, str(step), f"rollouts_rank{ddp_rank}.jsonl")
+        try:
+            with open(fname, "a") as fh:
+                for si, seq in enumerate(seqs):
+                    item = {
+                        "prompt_id": int(example_idx),
+                        "prompt_tokens": list(map(int, tokens)),
+                        "sequence_tokens": list(map(int, seq)),
+                        "reward": float(rewards[si]),
+                        "step": int(step),
+                        "sample_index": int(si),
+                        "seed": int(rollout_seed(step, int(example_idx), si)),
+                    }
+                    fh.write(json.dumps(item) + "\n")
+        except Exception:
+            # Do not crash training for IO errors; just log.
+            print0(f"Warning: failed to write rollouts to {fname}")
 
     max_length = max(len(s) for s in seqs)
     padded = [s + [assistant_end] * (max_length - len(s)) for s in seqs]
