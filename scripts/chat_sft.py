@@ -502,7 +502,7 @@ while True:
     # logging
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
+    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**step) # debias the EMA (step was already incremented, so it is the number of EMA updates)
     pct_done = 100 * progress
     tok_per_sec = int(args.total_batch_size / dt)
     flops_per_sec = num_flops_per_token * args.total_batch_size / dt

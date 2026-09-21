@@ -65,7 +65,8 @@ parser.add_argument("--device-batch-size", type=int, default=8, help="max batch 
 parser.add_argument("--examples-per-step", type=int, default=16, help="total examples per optimization step across all ranks")
 parser.add_argument("--num-samples", type=int, default=16, help="number of samples per example/question")
 # Generation
-parser.add_argument("--max-new-tokens", type=int, default=256, help="max tokens to generate per sample")
+parser.add_argument("--max-new-tokens", type=int, default=None,
+                    help="max tokens to generate per sample (default: task-dependent, see below)")
 parser.add_argument("--temperature", type=float, default=1.0, help="sampling temperature")
 parser.add_argument("--top-k", type=int, default=50, help="top-k sampling (0 = disabled)")
 # Optimization
@@ -130,6 +131,16 @@ if args.objective != "tpo":
     assert args.tpo_epochs == 1, "--tpo-epochs > 1 needs --objective tpo: the grpo path here has no " \
         "PPO ratio or clip, so reusing a rollout batch for it would be uncorrected off-policy"
 assert args.tpo_epochs >= 1
+# Resolve the task-dependent rollout length. GSM8K answers are chain-of-thought (median 89
+# tokens, max 262 in the training set) and need the long budget; ARC's target is a single
+# letter plus <|assistant_end|>, i.e. 2 tokens, and reward() parses the first letter out of
+# whatever was emitted. The budget is not just a cap on waste: Engine.generate only breaks
+# early once EVERY row in the group has emitted a stop token, so one rambling sample holds
+# the whole group open to max_new_tokens. 16 leaves room for "The answer is A." while
+# cutting the worst case 16x.
+MAX_NEW_TOKENS_BY_TASK = {"gsm8k": 256, "arc-easy": 16, "arc-challenge": 16}
+if args.max_new_tokens is None:
+    args.max_new_tokens = MAX_NEW_TOKENS_BY_TASK[args.task]
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
 
@@ -156,7 +167,7 @@ else:
     subset = "ARC-Easy" if args.task == "arc-easy" else "ARC-Challenge"
     train_task = ARC(subset=subset, split="train")
     val_task = ARC(subset=subset, split="test")
-print0(f"Task: {args.task} | train {len(train_task)} | val {len(val_task)}")
+print0(f"Task: {args.task} | train {len(train_task)} | val {len(val_task)} | max_new_tokens: {args.max_new_tokens}")
 num_steps = (len(train_task) // args.examples_per_step) * args.num_epochs
 print0(f"Calculated number of steps: {num_steps}")
 print0(f"Objective: {args.objective}"
@@ -521,7 +532,7 @@ for step in range(num_steps):
     if step % args.eval_every == 0:
         model.eval()
         passk = torch.zeros(args.device_batch_size, device=device) # pass@k for k=1..device_batch_size
-        records_iter = run_task_eval(val_task, tokenizer, engine, num_samples=args.device_batch_size, max_examples=args.eval_examples, temperature=1.0)
+        records_iter = run_task_eval(val_task, tokenizer, engine, num_samples=args.device_batch_size, max_examples=args.eval_examples, temperature=1.0, max_completion_tokens=args.max_new_tokens)
         records = list(records_iter) # collect all records
         for k in range(1, args.device_batch_size + 1):
             passk[k - 1] = sum(any(o["is_correct"] for o in r["outcomes"][:k]) for r in records)
