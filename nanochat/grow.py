@@ -25,10 +25,11 @@ What is NOT free, and is handled below:
     We pin the tap so it keeps capturing the same block's output.
   * `resid_lambdas` / `x0_lambdas` are `(n_layer,)` tensors that must be replaced,
     which orphans their AdamW moments unless they are migrated.
-  * Muon group state is a positionally-indexed `(chunk_size, *shape)` stack, so
-    appending to an existing group would misalign momentum rows against params.
-    New parameters therefore go into *new* param groups, which also happens to be
-    exactly where a separate learning rate belongs (see §"learning rate" below).
+  * Matrix optimizer state can be positionally indexed (Muon's is a
+    `(chunk_size, *shape)` stack), so appending to an existing group would
+    misalign it against parameters. New parameters therefore go into *new*
+    parameter groups, which also happens to be exactly where a separate learning
+    rate belongs (see §"learning rate" below).
 
 Learning rate: at nanochat's RL defaults (matrix_lr 0.02 x init_lr_frac 0.05 = 1e-3,
 decayed linearly to zero) a Muon step moves a matrix by ~1e-3 in spectral norm,
@@ -247,21 +248,47 @@ def grow_depth(model, optimizer, num_layers, position="middle", init="copy",
     model.window_sizes = model._compute_window_sizes(cfg)
 
     # --- optimizer: new params into NEW groups -------------------------------
-    muon_tmpl = next(g for g in optimizer.param_groups if g["kind"] == "muon")
     adamw_tmpl = next(g for g in optimizer.param_groups if g["kind"] == "adamw")
-    new_lr = muon_tmpl["initial_lr"] * lr_mult
+    # A grown layer inherits the matrix optimizer of the block immediately to its
+    # left (or block zero when prepending). This makes a growth run compatible
+    # with a depth-wise Muon/AdamW/Sophia layout without guessing a new policy.
+    source_matrix_param = src.attn.c_q.weight
+    matrix_tmpl = next(
+        g for g in optimizer.param_groups
+        if any(p is source_matrix_param for p in g["params"])
+    )
+    matrix_kind = matrix_tmpl["kind"]
+    new_lr = matrix_tmpl["initial_lr"] * lr_mult
     added = 0
     by_shape = {}
     for b in blocks:
         for p in b.parameters():
             by_shape.setdefault(tuple(p.shape), []).append(p)
     for shape in sorted(by_shape):
-        optimizer.add_param_group(dict(
-            kind="muon", params=by_shape[shape], lr=new_lr, initial_lr=new_lr,
-            momentum=muon_tmpl["momentum"], ns_steps=muon_tmpl["ns_steps"],
-            beta2=muon_tmpl["beta2"], weight_decay=muon_tmpl["weight_decay"],
+        common = dict(
+            kind=matrix_kind, params=by_shape[shape], lr=new_lr, initial_lr=new_lr,
+            is_matrix=True, layer_indices=tuple(range(at, at + k)),
+            weight_decay=matrix_tmpl["weight_decay"],
             grown_at=int(step), grow_warmup=int(warmup), grow_tag="new_matrix",
-        ))
+        )
+        if matrix_kind == "muon":
+            optimizer.add_param_group(dict(
+                **common, momentum=matrix_tmpl["momentum"], ns_steps=matrix_tmpl["ns_steps"],
+                beta2=matrix_tmpl["beta2"],
+            ))
+        elif matrix_kind == "adamw":
+            optimizer.add_param_group(dict(
+                **common, betas=matrix_tmpl["betas"], eps=matrix_tmpl["eps"],
+            ))
+        elif matrix_kind == "sophia":
+            optimizer.add_param_group(dict(
+                **common, betas=matrix_tmpl["betas"], rho=matrix_tmpl["rho"],
+                batch_size=matrix_tmpl["batch_size"],
+                hessian_update_interval=matrix_tmpl["hessian_update_interval"],
+                eps=matrix_tmpl["eps"],
+            ))
+        else:
+            raise AssertionError(f"Unknown matrix optimizer kind {matrix_kind!r}")
         added += len(by_shape[shape])
     if new_ve_params:
         ve_lr = adamw_tmpl["initial_lr"] * lr_mult
@@ -283,12 +310,13 @@ def grow_depth(model, optimizer, num_layers, position="middle", init="copy",
         "new_params": int(sum(p.numel() for b in blocks for p in b.parameters())
                           + sum(p.numel() for p in new_ve_params)),
         "total_params": int(sum(p.numel() for p in model.parameters())),
-        "new_lr": float(new_lr), "lr_mult": float(lr_mult), "warmup": int(warmup),
+        "new_lr": float(new_lr), "matrix_optimizer": matrix_kind,
+        "lr_mult": float(lr_mult), "warmup": int(warmup),
     }
     print0(f"[grow] step {step}: {old_n} -> {new_n} layers, inserted {k} at index {at} "
            f"(init={init}, ve={'on' if add_ve else 'off'}), "
            f"+{info['new_params']/1e6:.1f}M params -> {info['total_params']/1e6:.1f}M total, "
-           f"new-group lr={new_lr:.2e} (x{lr_mult}), backout tap -> layer {new_backout}")
+           f"new {matrix_kind} group lr={new_lr:.2e} (x{lr_mult}), backout tap -> layer {new_backout}")
     return info
 
 

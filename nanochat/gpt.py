@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
-from nanochat.optim import MuonAdamW
+from nanochat.optim import MuonAdamW, resolve_layer_optimizers
 
 # Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
 from nanochat.flash_attention import flash_attn
@@ -453,7 +453,20 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
+    def setup_optimizer(
+        self,
+        unembedding_lr=0.004,
+        embedding_lr=0.2,
+        matrix_lr=0.02,
+        weight_decay=0.0,
+        scalar_lr=0.5,
+        matrix_optimizer="muon",
+        layer_optimizers="",
+        sophia_lr=1e-4,
+        sophia_rho=0.04,
+        sophia_hessian_update_interval=10,
+        sophia_batch_size=1,
+    ):
         model_dim = self.config.n_embd
 
         # Separate out all parameters into groups
@@ -480,13 +493,52 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        # Muon groups (matrix params, grouped by shape for stacking)
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
-            ))
+        # Transformer blocks can use a different optimizer at each depth. Matrix
+        # groups are still split by shape for Muon stacking, while AdamW and Sophia
+        # benefit from the same grouping metadata for inspection and checkpoints.
+        layer_kinds = resolve_layer_optimizers(
+            layer_optimizers, self.config.n_layer, default=matrix_optimizer,
+        )
+        matrix_groups = {}
+        for layer_idx, (block, kind) in enumerate(zip(self.transformer.h, layer_kinds)):
+            for p in block.parameters():
+                key = (kind, tuple(p.shape))
+                group = matrix_groups.setdefault(key, {"params": [], "layer_indices": []})
+                group["params"].append(p)
+                group["layer_indices"].append(layer_idx)
+
+        for (kind, shape), group_info in sorted(matrix_groups.items()):
+            common = dict(
+                kind=kind,
+                params=group_info["params"],
+                is_matrix=True,
+                layer_indices=tuple(sorted(set(group_info["layer_indices"]))),
+                weight_decay=weight_decay,
+            )
+            if kind == 'muon':
+                param_groups.append(dict(
+                    **common, lr=matrix_lr,
+                    momentum=0.95, ns_steps=5, beta2=0.9,
+                ))
+            elif kind == 'adamw':
+                param_groups.append(dict(
+                    **common, lr=matrix_lr,
+                    betas=(0.9, 0.95), eps=1e-8,
+                ))
+            elif kind == 'sophia':
+                param_groups.append(dict(
+                    **common, lr=sophia_lr,
+                    betas=(0.965, 0.99), rho=sophia_rho,
+                    batch_size=sophia_batch_size,
+                    hessian_update_interval=sophia_hessian_update_interval,
+                    eps=1e-15,
+                ))
+            else:  # resolve_layer_optimizers validates this before we get here.
+                raise AssertionError(f"Unexpected matrix optimizer kind: {kind}")
+
+        counts = {kind: layer_kinds.count(kind) for kind in ("muon", "adamw", "sophia")}
+        summary = ", ".join(f"{kind}={count}" for kind, count in counts.items() if count)
+        print0(f"Transformer matrix optimizer layout: {summary} ({','.join(layer_kinds)})")
 
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:

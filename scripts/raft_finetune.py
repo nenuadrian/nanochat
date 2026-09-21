@@ -67,6 +67,12 @@ def main():
     parser.add_argument('--epochs', type=int, default=1)
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=5e-4)
+    parser.add_argument('--matrix-optimizer', type=str, default='muon', choices=['muon', 'adamw', 'sophia'])
+    parser.add_argument('--layer-optimizers', type=str, default='', help='sophia-middle, or e.g. muon*4,sophia*12,adamw*4')
+    parser.add_argument('--sophia-lr', type=float, default=1e-4)
+    parser.add_argument('--sophia-rho', type=float, default=0.04)
+    parser.add_argument('--sophia-hessian-update-interval', type=int, default=10)
+    parser.add_argument('--sophia-batch-size', type=int, default=-1, help='sequences represented by a Sophia gradient; -1 uses --batch-size')
     parser.add_argument('--max-len', type=int, default=1024)
     parser.add_argument('--device', type=str, default='')
     parser.add_argument('--output-tag', type=str, default=None)
@@ -86,8 +92,23 @@ def main():
         raise SystemExit('No training examples found in ' + args.train_file)
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, collate_fn=lambda b: collate_fn(b, pad_id=tokenizer.encode_special('<|assistant_end|>')))
 
-    # Optimizer like chat_rl uses
-    optimizer = model.setup_optimizer(unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0)
+    # Optimizer like chat_rl uses. --lr below remains the common fine-tuning LR
+    # override for every group, including any Sophia-assigned block.
+    sophia_batch_size = args.batch_size if args.sophia_batch_size == -1 else args.sophia_batch_size
+    if sophia_batch_size <= 0:
+        raise ValueError('--sophia-batch-size must be positive or -1 for automatic resolution')
+    optimizer = model.setup_optimizer(
+        unembedding_lr=0.004,
+        embedding_lr=0.2,
+        matrix_lr=0.02,
+        weight_decay=0.0,
+        matrix_optimizer=args.matrix_optimizer,
+        layer_optimizers=args.layer_optimizers,
+        sophia_lr=args.sophia_lr,
+        sophia_rho=args.sophia_rho,
+        sophia_hessian_update_interval=args.sophia_hessian_update_interval,
+        sophia_batch_size=sophia_batch_size,
+    )
     for g in optimizer.param_groups:
         g['lr'] = g.get('lr', 1e-3) * 0.01  # scale down default; user-managed via --lr
         g['initial_lr'] = g['lr']

@@ -84,8 +84,14 @@ parser.add_argument("--top-k", type=int, default=50, help="top-k sampling (0 = d
 # Optimization
 parser.add_argument("--embedding-lr", type=float, default=0.2, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
-parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
-parser.add_argument("--weight-decay", type=float, default=0.0, help="weight decay for embedding/unembedding parameters (Adam)")
+parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for Muon or AdamW transformer matrices")
+parser.add_argument("--matrix-optimizer", type=str, default="muon", choices=["muon", "adamw", "sophia"], help="default optimizer for all transformer blocks")
+parser.add_argument("--layer-optimizers", type=str, default="", help="per-block matrix optimizer layout: sophia-middle, or e.g. muon*4,sophia*12,adamw*4")
+parser.add_argument("--sophia-lr", type=float, default=1e-4, help="Sophia-G learning rate for Sophia-assigned blocks")
+parser.add_argument("--sophia-rho", type=float, default=0.04, help="Sophia-G clipping parameter rho")
+parser.add_argument("--sophia-hessian-update-interval", type=int, default=10, help="refresh Sophia curvature every N optimizer steps")
+parser.add_argument("--sophia-batch-size", type=int, default=-1, help="examples represented by a Sophia gradient; -1 uses --examples-per-step")
+parser.add_argument("--weight-decay", type=float, default=0.0, help="weight decay for transformer matrix parameters")
 parser.add_argument("--init-lr-frac", type=float, default=0.05, help="initial LR as fraction of base LR")
 # Evaluation / checkpointing
 parser.add_argument("--eval-every", type=int, default=60, help="evaluate pass@k every N steps (-1 = disable)")
@@ -634,11 +640,22 @@ def run_task_eval(task, tokenizer, engine,
 # Training loop
 
 # Init the optimizer
+sophia_batch_size = args.examples_per_step if args.sophia_batch_size == -1 else args.sophia_batch_size
+if sophia_batch_size <= 0:
+    raise ValueError("--sophia-batch-size must be positive or -1 for automatic resolution")
+if args.matrix_optimizer == "sophia" or args.layer_optimizers:
+    print0(f"Sophia-G batch size: {sophia_batch_size} examples")
 optimizer = model.setup_optimizer(
     unembedding_lr=args.unembedding_lr,
     embedding_lr=args.embedding_lr,
     matrix_lr=args.matrix_lr,
     weight_decay=args.weight_decay,
+    matrix_optimizer=args.matrix_optimizer,
+    layer_optimizers=args.layer_optimizers,
+    sophia_lr=args.sophia_lr,
+    sophia_rho=args.sophia_rho,
+    sophia_hessian_update_interval=args.sophia_hessian_update_interval,
+    sophia_batch_size=sophia_batch_size,
 )
 
 # Set the initial learning rate as a fraction of the base learning rate

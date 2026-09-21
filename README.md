@@ -105,6 +105,34 @@ This uses wandb (run name "d12"), only runs the CORE metric on last step, and it
 
 See an example [here](https://github.com/karpathy/nanochat/pull/498#issuecomment-3850720044).
 
+### Depth-wise matrix optimizer experiments
+
+The transformer blocks can use Muon, AdamW, or Sophia-G independently of the
+existing AdamW embedding, head, and scalar groups. `--matrix-optimizer` selects
+the default for every block; `--layer-optimizers` overrides it with a depth
+layout. The convenience layout `sophia-middle` keeps the outer thirds on the
+default optimizer and applies Sophia-G to the middle remainder. At depth 20 that
+is `Muon*6, Sophia*8, Muon*6`.
+
+```bash
+# A controlled middle-Sophia pretraining arm (d12 = Muon*4, Sophia*4, Muon*4).
+OMP_NUM_THREADS=1 torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
+    --depth=12 --run=d12-sophia-middle --model-tag=d12-sophia-middle \
+    --layer-optimizers=sophia-middle \
+    --sophia-lr=1e-4 --sophia-rho=0.04 --sophia-hessian-update-interval=10
+
+# An explicit three-way layout; the repeat counts must add up to --depth.
+torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
+    --depth=20 --layer-optimizers=muon*4,sophia*12,adamw*4
+```
+
+Sophia-G uses a clipped gradient-square curvature proxy, refreshed every ten
+optimizer steps by default. `--sophia-batch-size=-1` (the default) derives the
+number of sequences from the global token batch and sequence length. The SFT,
+RL, and RAFT scripts accept the same layout and Sophia flags. SFT inherits the
+pretraining layout by default; use `--load-optimizer=0` when changing its layout
+because Muon and Sophia optimizer states are not interchangeable.
+
 The important thing to note is that nanochat is written and configured around one single dial of complexity - the depth of the transformer. This single integer automatically determines all other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) so that the trained model comes out compute optimal. The idea is that the user doesn't have to think about or set any of this, they are simply asking for a smaller or bigger model using `--depth`, and everything "just works". By sweeping out the depth, you achieve the nanochat miniseries of compute optimal models at various sizes. GPT-2 capability model (which is of most interest at the moment) happens to be somewhere around d24-d26 range with the current code. But any candidate changes to the repo have to be principled enough that they work for all settings of depth.
 
 ## Running on CPU / MPS

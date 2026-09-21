@@ -112,3 +112,31 @@ def test_muon_update_is_orthogonalized():
     # NorMuon variance reduction rescales the magnitude, so normalize by the mean
     svals = svals / svals.mean()
     assert svals.max() / svals.min() < 4.0, f"update far from semi-orthogonal: {svals}"
+
+
+def test_sophia_g_uses_clipped_curvature_preconditioner():
+    """Sophia-G initializes and refreshes its curvature state on schedule."""
+    initial = torch.tensor([1.0, -1.0], device=DEVICE)
+    p = torch.nn.Parameter(initial.clone())
+    lr, beta1, beta2, rho, batch_size = 1e-3, 0.965, 0.99, 0.04, 8
+    opt = MuonAdamW([dict(
+        kind="sophia", params=[p], lr=lr, betas=(beta1, beta2), rho=rho,
+        batch_size=batch_size, hessian_update_interval=2, eps=1e-15,
+        weight_decay=0.0,
+    )])
+
+    grad = torch.tensor([100.0, -100.0], device=DEVICE)
+    p.grad = grad.clone()
+    opt.step()
+    state = opt.state[p]
+    expected_m = (1 - beta1) * grad
+    expected_h = (1 - beta2) * grad.square()
+    expected_update = (expected_m.abs() / (rho * batch_size * expected_h)).clamp(max=1) * expected_m.sign()
+    torch.testing.assert_close(p, initial - lr * expected_update, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(state["hessian"], expected_h, rtol=1e-5, atol=1e-6)
+
+    first_hessian = state["hessian"].clone()
+    p.grad = torch.zeros_like(p)
+    opt.step()  # interval=2, so this refresh must decay the hessian state
+    assert state["step"] == 2
+    assert torch.all(state["hessian"] < first_hessian)

@@ -50,7 +50,13 @@ parser.add_argument("--total-batch-size", type=int, default=None, help="total ba
 # Optimization (default: inherit from pretrained checkpoint)
 parser.add_argument("--embedding-lr", type=float, default=None, help="learning rate for embedding parameters (Adam) (default: inherit from pretrain)")
 parser.add_argument("--unembedding-lr", type=float, default=None, help="learning rate for unembedding parameters (Adam) (default: inherit from pretrain)")
-parser.add_argument("--matrix-lr", type=float, default=None, help="learning rate for matrix parameters (Muon) (default: inherit from pretrain)")
+parser.add_argument("--matrix-lr", type=float, default=None, help="learning rate for Muon or AdamW transformer matrices (default: inherit from pretrain)")
+parser.add_argument("--matrix-optimizer", type=str, default=None, choices=["muon", "adamw", "sophia"], help="default optimizer for transformer blocks (default: inherit from pretrain)")
+parser.add_argument("--layer-optimizers", type=str, default=None, help="per-block matrix optimizer layout: sophia-middle, or e.g. muon*4,sophia*12,adamw*4 (default: inherit from pretrain)")
+parser.add_argument("--sophia-lr", type=float, default=None, help="Sophia-G learning rate (default: inherit from pretrain)")
+parser.add_argument("--sophia-rho", type=float, default=None, help="Sophia-G clipping parameter rho (default: inherit from pretrain)")
+parser.add_argument("--sophia-hessian-update-interval", type=int, default=None, help="refresh Sophia curvature every N steps (default: inherit from pretrain)")
+parser.add_argument("--sophia-batch-size", type=int, default=-1, help="sequences represented by a Sophia gradient; -1 derives total_batch_size / max_seq_len")
 parser.add_argument("--init-lr-frac", type=float, default=0.8, help="initial LR as fraction of base LR")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
@@ -109,6 +115,11 @@ for name, fallback, source in [
     ("embedding_lr",      0.3,   pretrain_user_config),
     ("unembedding_lr",    0.004, pretrain_user_config),
     ("matrix_lr",         0.02,  pretrain_user_config),
+    ("matrix_optimizer",  "muon", pretrain_user_config),
+    ("layer_optimizers",  "",    pretrain_user_config),
+    ("sophia_lr",         1e-4,  pretrain_user_config),
+    ("sophia_rho",        0.04,  pretrain_user_config),
+    ("sophia_hessian_update_interval", 10, pretrain_user_config),
 ]:
     arg_val = getattr(args, name)
     pretrain_val = source.get(name)
@@ -134,9 +145,28 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {args.total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 token_bytes = get_token_bytes(device=device)
 
+sophia_batch_size = args.sophia_batch_size
+if sophia_batch_size == -1:
+    sophia_batch_size = max(1, args.total_batch_size // args.max_seq_len)
+if sophia_batch_size <= 0:
+    raise ValueError("--sophia-batch-size must be positive or -1 for automatic resolution")
+if args.matrix_optimizer == "sophia" or args.layer_optimizers:
+    print0(f"Sophia-G batch size: {sophia_batch_size} sequences")
+
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 # Note that pretraining ramps weight_decay to zero by end of pretraining, so SFT continues with zero
-optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0)
+optimizer = model.setup_optimizer(
+    unembedding_lr=args.unembedding_lr,
+    embedding_lr=args.embedding_lr,
+    matrix_lr=args.matrix_lr,
+    weight_decay=0.0,
+    matrix_optimizer=args.matrix_optimizer,
+    layer_optimizers=args.layer_optimizers,
+    sophia_lr=args.sophia_lr,
+    sophia_rho=args.sophia_rho,
+    sophia_hessian_update_interval=args.sophia_hessian_update_interval,
+    sophia_batch_size=sophia_batch_size,
+)
 
 # Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.)
 # Note: load_state_dict overwrites param_group metadata (LRs, betas, etc.) with the
@@ -146,12 +176,18 @@ base_dir = get_base_dir()
 if args.load_optimizer:
     optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
     if optimizer_data is not None:
-        base_lrs = [group["lr"] for group in optimizer.param_groups]
-        optimizer.load_state_dict(optimizer_data)
-        del optimizer_data
-        for group, base_lr in zip(optimizer.param_groups, base_lrs):
-            group["lr"] = base_lr
-        print0("Loaded optimizer state from pretrained checkpoint (momentum buffers only, LRs reset)")
+        current_layout = [(g["kind"], len(g["params"])) for g in optimizer.param_groups]
+        saved_layout = [(g["kind"], len(g["params"])) for g in optimizer_data["param_groups"]]
+        if current_layout == saved_layout:
+            base_lrs = [group["lr"] for group in optimizer.param_groups]
+            optimizer.load_state_dict(optimizer_data)
+            del optimizer_data
+            for group, base_lr in zip(optimizer.param_groups, base_lrs):
+                group["lr"] = base_lr
+            print0("Loaded optimizer state from pretrained checkpoint (momentum buffers only, LRs reset)")
+        else:
+            del optimizer_data
+            print0("Skipping pretrained optimizer state: its parameter-group layout differs from the requested matrix optimizer layout")
     else:
         print0("WARNING: optimizer checkpoint not found, starting with fresh optimizer (slightly worse)")
 

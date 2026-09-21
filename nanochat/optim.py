@@ -14,6 +14,66 @@ import torch.distributed as dist
 from torch import Tensor
 from nanochat.common import COMPUTE_DTYPE
 
+
+MATRIX_OPTIMIZER_KINDS = ("muon", "adamw", "sophia")
+
+
+def resolve_layer_optimizers(spec: str, n_layer: int, default: str = "muon") -> tuple[str, ...]:
+    """Resolve a concise per-transformer-block optimizer specification.
+
+    ``spec`` is either empty (all blocks use ``default``), ``sophia-middle``
+    (the middle third uses Sophia), or a comma-separated list such as
+    ``muon*4,sophia*12,adamw*4``. A bare kind represents one block. The
+    expanded specification must name every block exactly once.
+    """
+    default = default.lower().strip()
+    if default not in MATRIX_OPTIMIZER_KINDS:
+        raise ValueError(
+            f"Unknown default matrix optimizer {default!r}; expected one of "
+            f"{', '.join(MATRIX_OPTIMIZER_KINDS)}"
+        )
+    if n_layer <= 0:
+        raise ValueError(f"n_layer must be positive, got {n_layer}")
+
+    spec = (spec or "").lower().strip()
+    if not spec:
+        return (default,) * n_layer
+    if spec in {"sophia-middle", "middle-sophia"}:
+        outer = n_layer // 3
+        return (default,) * outer + ("sophia",) * (n_layer - 2 * outer) + (default,) * outer
+
+    layout: list[str] = []
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            raise ValueError(f"Invalid empty entry in --layer-optimizers={spec!r}")
+        if "*" in token:
+            kind, count_text = token.split("*", 1)
+            try:
+                count = int(count_text)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid repeat count {count_text!r} in --layer-optimizers={spec!r}"
+                ) from exc
+            if count <= 0:
+                raise ValueError(f"Repeat counts must be positive, got {token!r}")
+        else:
+            kind, count = token, 1
+        kind = kind.strip()
+        if kind not in MATRIX_OPTIMIZER_KINDS:
+            raise ValueError(
+                f"Unknown layer optimizer {kind!r}; expected one of "
+                f"{', '.join(MATRIX_OPTIMIZER_KINDS)}"
+            )
+        layout.extend([kind] * count)
+
+    if len(layout) != n_layer:
+        raise ValueError(
+            f"--layer-optimizers={spec!r} expands to {len(layout)} layers, "
+            f"but this model has {n_layer}."
+        )
+    return tuple(layout)
+
 # -----------------------------------------------------------------------------
 """
 Good old AdamW optimizer, fused kernel.
@@ -61,6 +121,54 @@ def adamw_step_fused(
     p.copy_(p32)
     exp_avg.copy_(exp_avg32)
     exp_avg_sq.copy_(exp_avg_sq32)
+
+
+# -----------------------------------------------------------------------------
+"""
+Sophia-G, the gradient-square (Gauss-Newton-Bartlett) form of Sophia.
+https://arxiv.org/abs/2305.14342
+
+The curvature estimate is refreshed every ``hessian_update_interval`` optimizer
+steps. It is a gradient-square proxy rather than an exact Hessian diagonal, which
+keeps this compatible with nanochat's ordinary single-backward training loop.
+"""
+
+@torch.compile(dynamic=False, fullgraph=True)
+def sophia_step_fused(
+    p: Tensor,
+    grad: Tensor,
+    exp_avg: Tensor,
+    hessian: Tensor,
+    lr_t: Tensor,
+    beta1_t: Tensor,
+    beta2_t: Tensor,
+    rho_t: Tensor,
+    batch_size_t: Tensor,
+    eps_t: Tensor,
+    wd_t: Tensor,
+    update_hessian: bool,
+) -> None:
+    """One fused Sophia-G step with decoupled weight decay and clipped updates."""
+    # Keep optimizer math in fp32. Some embedding-like tensors are bf16 and the
+    # curvature accumulator needs substantially more range than bf16 arithmetic.
+    p32 = p.float()
+    grad32 = grad.float()
+    exp_avg32 = exp_avg.float()
+    hessian32 = hessian.float()
+
+    p32.mul_(1 - lr_t * wd_t)
+    exp_avg32.lerp_(grad32, 1 - beta1_t)
+    if update_hessian:
+        hessian32.lerp_(grad32.square(), 1 - beta2_t)
+
+    # This matches Sophia-G's |m| / (rho * batch_size * h) <= 1 clipping.
+    denom = rho_t * batch_size_t * hessian32 + eps_t
+    update = (exp_avg32.abs() / denom).clamp(max=1.0) * exp_avg32.sign()
+    p32.add_(update, alpha=-lr_t)
+
+    p.copy_(p32)
+    exp_avg.copy_(exp_avg32)
+    hessian.copy_(hessian32)
 
 # -----------------------------------------------------------------------------
 """
@@ -183,7 +291,8 @@ def muon_step_fused(
 
 class MuonAdamW(torch.optim.Optimizer):
     """
-    Combined optimizer: Muon for 2D matrix params, AdamW for others.
+    Combined optimizer: Muon, AdamW, or Sophia-G for matrix params, and AdamW
+    for embeddings and scalar parameters.
 
     AdamW - Fused AdamW optimizer step.
 
@@ -226,7 +335,7 @@ class MuonAdamW(torch.optim.Optimizer):
             - Wait for all gathers to complete
             - Copy updated params back to original tensors (Muon only)
 
-    AdamW Communication (ZeRO-2 style):
+    AdamW/Sophia Communication (ZeRO-2 style):
     - Small params (<1024 elements): all_reduce gradients, update full param on each rank.
       Optimizer state is replicated but these params are tiny (scalars, biases).
     - Large params: reduce_scatter gradients so each rank gets 1/N of the grad, update
@@ -253,12 +362,28 @@ class MuonAdamW(torch.optim.Optimizer):
     Arguments:
         param_groups: List of dicts, each containing:
             - 'params': List of parameters
-            - 'kind': 'adamw' or 'muon'
+            - 'kind': 'adamw', 'muon', or 'sophia'
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
+            - For Sophia groups: 'lr', 'betas', 'rho', 'batch_size',
+              'hessian_update_interval', 'eps', 'weight_decay'
+
+    Sophia groups use the Sophia-G gradient-square curvature proxy. ``batch_size``
+    is the number of sequences represented by the averaged gradient, not tokens.
     """
     def __init__(self, param_groups: list[dict]):
         super().__init__(param_groups, defaults={})
+        for group in self.param_groups:
+            kind = group.get("kind")
+            if kind not in MATRIX_OPTIMIZER_KINDS:
+                raise ValueError(f"Unknown optimizer kind: {kind!r}")
+            if kind == "sophia":
+                if group["rho"] <= 0:
+                    raise ValueError("Sophia rho must be positive")
+                if group["batch_size"] <= 0:
+                    raise ValueError("Sophia batch_size must be positive")
+                if group["hessian_update_interval"] <= 0:
+                    raise ValueError("Sophia hessian_update_interval must be positive")
         # 0-D CPU tensors to avoid torch.compile recompilation when values change
         self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
@@ -266,6 +391,13 @@ class MuonAdamW(torch.optim.Optimizer):
         self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._sophia_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._sophia_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._sophia_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._sophia_rho_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._sophia_batch_size_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._sophia_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._sophia_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
@@ -359,6 +491,48 @@ class MuonAdamW(torch.optim.Optimizer):
                 future = dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
                 gather_list.append(dict(future=future, params=None))
 
+    def _compute_sophia(self, group: dict, info: dict, gather_list: list, rank: int, world_size: int) -> None:
+        """Wait for reduce, compute Sophia-G updates, then launch gathers."""
+        param_infos = info['param_infos']
+        for p in group['params']:
+            pinfo = param_infos[p]
+            if pinfo['future'] is not None:
+                pinfo['future'].wait()
+            grad_slice = pinfo['grad_slice']
+            state = self.state[p]
+
+            if pinfo['is_small']:
+                p_slice = p
+            else:
+                rank_size = p.shape[0] // world_size
+                p_slice = p[rank * rank_size:(rank + 1) * rank_size]
+
+            if not state:
+                state['step'] = 0
+                state['exp_avg'] = torch.zeros_like(p_slice)
+                state['hessian'] = torch.zeros_like(p_slice)
+            state['step'] += 1
+            interval = group['hessian_update_interval']
+            update_hessian = state['step'] == 1 or state['step'] % interval == 0
+
+            self._sophia_lr_t.fill_(group['lr'])
+            self._sophia_beta1_t.fill_(group['betas'][0])
+            self._sophia_beta2_t.fill_(group['betas'][1])
+            self._sophia_rho_t.fill_(group['rho'])
+            self._sophia_batch_size_t.fill_(group['batch_size'])
+            self._sophia_eps_t.fill_(group['eps'])
+            self._sophia_wd_t.fill_(group['weight_decay'])
+            sophia_step_fused(
+                p_slice, grad_slice, state['exp_avg'], state['hessian'],
+                self._sophia_lr_t, self._sophia_beta1_t, self._sophia_beta2_t,
+                self._sophia_rho_t, self._sophia_batch_size_t, self._sophia_eps_t,
+                self._sophia_wd_t, update_hessian,
+            )
+
+            if not pinfo['is_small']:
+                future = dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
+                gather_list.append(dict(future=future, params=None))
+
     def _compute_muon(self, group: dict, info: dict, gather_list: list, rank: int) -> None:
         """Wait for reduce, compute Muon updates, launch gather."""
         if info['future'] is not None:
@@ -440,6 +614,8 @@ class MuonAdamW(torch.optim.Optimizer):
         for group in self.param_groups:
             if group['kind'] == 'adamw':
                 reduce_infos.append(self._reduce_adamw(group, world_size))
+            elif group['kind'] == 'sophia':
+                reduce_infos.append(self._reduce_adamw(group, world_size))
             elif group['kind'] == 'muon':
                 reduce_infos.append(self._reduce_muon(group, world_size))
             else:
@@ -450,6 +626,8 @@ class MuonAdamW(torch.optim.Optimizer):
         for group, info in zip(self.param_groups, reduce_infos):
             if group['kind'] == 'adamw':
                 self._compute_adamw(group, info, gather_list, rank, world_size)
+            elif group['kind'] == 'sophia':
+                self._compute_sophia(group, info, gather_list, rank, world_size)
             elif group['kind'] == 'muon':
                 self._compute_muon(group, info, gather_list, rank)
             else:

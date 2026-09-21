@@ -61,8 +61,14 @@ parser.add_argument("--device-batch-size", type=int, default=32, help="per-devic
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learning rate for unembedding parameters (Adam)")
-parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
-parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
+parser.add_argument("--weight-decay", type=float, default=0.28, help="weight decay for transformer matrix parameters (cautious for Muon, decoupled for AdamW/Sophia)")
+parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for Muon or AdamW transformer matrices")
+parser.add_argument("--matrix-optimizer", type=str, default="muon", choices=["muon", "adamw", "sophia"], help="default optimizer for all transformer blocks")
+parser.add_argument("--layer-optimizers", type=str, default="", help="per-block matrix optimizer layout: sophia-middle, or e.g. muon*4,sophia*12,adamw*4")
+parser.add_argument("--sophia-lr", type=float, default=1e-4, help="Sophia-G learning rate for Sophia-assigned blocks")
+parser.add_argument("--sophia-rho", type=float, default=0.04, help="Sophia-G clipping parameter rho")
+parser.add_argument("--sophia-hessian-update-interval", type=int, default=10, help="refresh Sophia's gradient-square curvature estimate every N optimizer steps")
+parser.add_argument("--sophia-batch-size", type=int, default=-1, help="sequences represented by a Sophia gradient; -1 derives total_batch_size / max_seq_len")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
@@ -310,16 +316,30 @@ weight_decay_scaled = args.weight_decay * math.sqrt(total_batch_size / B_REF) * 
 if weight_decay_scaled != args.weight_decay:
     print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
 
+sophia_batch_size = args.sophia_batch_size
+if sophia_batch_size == -1:
+    sophia_batch_size = max(1, total_batch_size // args.max_seq_len)
+if sophia_batch_size <= 0:
+    raise ValueError("--sophia-batch-size must be positive or -1 for automatic resolution")
+if args.matrix_optimizer == "sophia" or args.layer_optimizers:
+    print0(f"Sophia-G batch size: {sophia_batch_size} sequences")
+
 # -----------------------------------------------------------------------------
-# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
+# Initialize the Optimizer (Muon/AdamW/Sophia matrices, AdamW for embeddings/scalars)
 optimizer = model.setup_optimizer(
     # AdamW hyperparameters
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
     scalar_lr=args.scalar_lr * batch_lr_scale,
-    # Muon hyperparameters
+    # Transformer-matrix hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
+    matrix_optimizer=args.matrix_optimizer,
+    layer_optimizers=args.layer_optimizers,
+    sophia_lr=args.sophia_lr * batch_lr_scale,
+    sophia_rho=args.sophia_rho,
+    sophia_hessian_update_interval=args.sophia_hessian_update_interval,
+    sophia_batch_size=sophia_batch_size,
 )
 
 if resuming:
@@ -399,7 +419,7 @@ def get_muon_momentum(it):
     else:
         return 0.97
 
-# Weight decay scheduler for Muon optimizer (cosine decay to zero over the course of training)
+# Weight decay scheduler for all transformer matrix optimizers (cosine decay to zero)
 def get_weight_decay(it):
     return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * it / num_iterations))
 
@@ -543,6 +563,9 @@ while True:
         group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
+        # Older optimizer checkpoints predate the is_matrix marker; their only
+        # Muon groups are transformer matrices, so retain the old schedule too.
+        if group.get('is_matrix') or group['kind'] == 'muon':
             group["weight_decay"] = muon_weight_decay
     grad_norm = None # global grad norm, only measured on wandb logging steps (costs a sync)
     will_log_wandb = step % 100 == 0
