@@ -6,8 +6,10 @@
 #SBATCH --job-name=%RUN_NAME%
 #SBATCH --output=logs/%RUN_NAME%_%DEPTH%_%JOBTAG%.out
 #SBATCH --error=logs/%RUN_NAME%_%DEPTH%_%JOBTAG%.err
-#SBATCH --partition=h200
-#SBATCH --gres=gpu:h200:1
+# Partition is set at submission time (use `sbatch --partition=...`).
+#SBATCH --partition=
+# Generic GPU gres; override in the template if you need a specific GPU type.
+#SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
