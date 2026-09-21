@@ -10,6 +10,7 @@
 #SBATCH --partition=
 # Generic GPU gres; override in the template if you need a specific GPU type.
 #SBATCH --gres=gpu:1
+#SBATCH --account=gpu-h200-fse-pgdr
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
