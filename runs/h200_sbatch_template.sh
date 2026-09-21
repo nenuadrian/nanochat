@@ -4,10 +4,8 @@
 ## Expects these args to be provided to construct the command.
 
 #SBATCH --job-name=%RUN_NAME%
-#SBATCH --output=logs/%RUN_NAME%_%DEPTH%_%JOBTAG%.out
-#SBATCH --error=logs/%RUN_NAME%_%DEPTH%_%JOBTAG%.err
-# Partition is set at submission time (use `sbatch --partition=...`).
-#SBATCH --partition=
+## Output/error/job-name are passed at submission time so they reflect the
+## chosen run name and depth. Keep static resource/account directives here.
 # Generic GPU gres; override in the template if you need a specific GPU type.
 #SBATCH --gres=gpu:1
 #SBATCH --account=gpu-h200-fse-pgdr

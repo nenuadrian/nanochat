@@ -19,12 +19,20 @@ mkdir -p logs
 for d in $(seq ${START_DEPTH} ${INCR} ${END_DEPTH}); do
   RUN_NAME="${RUN_BASE}_d${d}"
   echo "Submitting depth ${d} as ${RUN_NAME}"
-  sbatch --partition=${PARTITION} ${TEMPLATE} ${RUN_NAME} ${d} ${JOBTAG}
+  sbatch --partition=${PARTITION} \
+    --job-name=${RUN_NAME} \
+    --output=logs/${RUN_NAME}_${d}_${JOBTAG}.out \
+    --error=logs/${RUN_NAME}_${d}_${JOBTAG}.err \
+    ${TEMPLATE} ${RUN_NAME} ${d} ${JOBTAG}
   sleep 0.5
 done
 
 echo "Also submitting baseline (no-growth) job"
 
-sbatch --partition=${PARTITION} ${TEMPLATE} ${RUN_BASE}_baseline ${START_DEPTH} baseline
+sbatch --partition=${PARTITION} \
+  --job-name=${RUN_BASE}_baseline \
+  --output=logs/${RUN_BASE}_baseline_${START_DEPTH}_baseline.out \
+  --error=logs/${RUN_BASE}_baseline_${START_DEPTH}_baseline.err \
+  ${TEMPLATE} ${RUN_BASE}_baseline ${START_DEPTH} baseline
 
 echo "Submitted jobs for depths ${START_DEPTH}..${END_DEPTH} (step ${INCR})."
