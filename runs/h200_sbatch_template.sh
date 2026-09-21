@@ -58,6 +58,25 @@ except Exception:
         pass
 PY
 
+# Install project dependencies from requirements-csf3.txt. Choose torch wheel
+# based on whether this job is running on a GPU partition. This is best-effort
+# and skips failures so the job can still proceed if pip install fails.
+REQ_FILE="$PWD/requirements-csf3.txt"
+if [ -f "$REQ_FILE" ]; then
+  python -m pip install --upgrade pip setuptools wheel || true
+  # Install common deps (excludes torch-specific wheel)
+  python -m pip install --no-cache-dir -r "$REQ_FILE" || true
+  # Install torch variant appropriate for GPU/CPU
+  PART=${SLURM_JOB_PARTITION:-}
+  if echo "${PART}" | grep -qi "^gpu"; then
+    # GPU partition: install CUDA 12.8 wheel
+    python -m pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu128 torch==2.9.1 || true
+  else
+    # CPU-only: install CPU wheel
+    python -m pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu torch==2.9.1 || true
+  fi
+fi
+
 # model path on csf3 (adjust as needed)
 MODEL_TAG=${MODEL_TAG:-d${DEPTH}narrow}
 MODEL_PATH=${MODEL_PATH:-/home/${USER}/models/${MODEL_TAG}}
