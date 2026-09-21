@@ -25,8 +25,38 @@ echo "Starting job: ${RUN_NAME} depth=${DEPTH} tag=${JOBTAG}"
 
 # load modules / activate environment (adjust to your cluster)
 module purge || true
+# Try to load conda module if available
 module load anaconda/2023.11 || true
-source activate /home/${USER}/.conda/envs/nanochat || true
+# Robust Conda/venv activation: prefer conda env 'nanochat' if present,
+# otherwise fall back to a venv at $HOME/.venv/nanochat if it exists.
+if [ -n "${CONDA_PREFIX:-}" ]; then
+  : # already inside conda
+else
+  if command -v conda >/dev/null 2>&1; then
+    # Source conda sh to enable `conda activate` in non-interactive shells
+    CONDA_BASE=$(conda info --base 2>/dev/null || echo "")
+    if [ -n "$CONDA_BASE" ] && [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
+      . "$CONDA_BASE/etc/profile.d/conda.sh"
+      conda activate nanochat || true
+    fi
+  fi
+fi
+# Fallback to a virtualenv if the conda env is not present
+if [ -z "${CONDA_PREFIX:-}" ] && [ -f "$HOME/.venv/nanochat/bin/activate" ]; then
+  source "$HOME/.venv/nanochat/bin/activate"
+fi
+
+# Ensure wandb is installed in the runtime environment (non-fatal if install fails)
+python - <<'PY'
+try:
+    import wandb
+except Exception:
+    import sys, subprocess
+    try:
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--no-cache-dir', 'wandb'])
+    except Exception:
+        pass
+PY
 
 # model path on csf3 (adjust as needed)
 MODEL_TAG=${MODEL_TAG:-d${DEPTH}narrow}
