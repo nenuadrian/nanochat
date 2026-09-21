@@ -50,6 +50,17 @@ def fresh_optimizer(model):
     return opt
 
 
+def test_depth_memory_attention_runs_when_enabled():
+    cfg = GPTConfig(sequence_len=64, vocab_size=128, n_layer=4,
+                    n_head=2, n_kv_head=2, n_embd=32,
+                    window_pattern="L", depth_memory_layers=2)
+    model = GPT(cfg)
+    model.init_weights()
+    ids = probe(model, seed=321, B=1, T=12)
+    out = model(ids)
+    assert out.shape == (1, 12, 128)
+
+
 # --------------------------------------------------------------------------- #
 # function preservation
 

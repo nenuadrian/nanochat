@@ -33,6 +33,9 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
+    # Optional sparse depth-memory attention. 0 disables the feature; otherwise each
+    # layer can attend to the previous K layers' hidden states as a second memory axis.
+    depth_memory_layers: int = 0
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
@@ -93,6 +96,8 @@ class CausalSelfAttention(nn.Module):
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
+        self.depth_memory_layers = int(getattr(config, "depth_memory_layers", 0))
+        self.depth_embedding = nn.Parameter(torch.zeros(config.n_layer, self.n_embd)) if self.depth_memory_layers > 0 else None
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
         self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
@@ -106,8 +111,11 @@ class CausalSelfAttention(nn.Module):
             use_ve = has_ve(layer_idx, config.n_layer)
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if use_ve else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, depth_memory=None):
         B, T, C = x.size()
+
+        if self.depth_memory_layers > 0 and self.depth_embedding is not None:
+            x = x + self.depth_embedding[self.layer_idx].view(1, 1, -1).to(x.dtype)
 
         # Project the input to get queries, keys, and values
         # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
@@ -121,34 +129,84 @@ class CausalSelfAttention(nn.Module):
             gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 3)
             v = v + gate.unsqueeze(-1) * ve
 
-        # Apply Rotary Embeddings to queries and keys to get relative positional encoding
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k) # QK norm
-        q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
-        k = k * 1.2
+        # Optional sparse depth-memory attention: append a small set of prior layer states as
+        # extra key/value memory. This preserves the original attention path and only adds an
+        # auxiliary memory axis when the feature is enabled.
+        if self.depth_memory_layers > 0 and depth_memory:
+            cos, sin = cos_sin
+            q = apply_rotary_emb(q, cos, sin)
+            k = apply_rotary_emb(k, cos, sin)
 
-        # Flash Attention (FA3 or SDPA fallback)
-        # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
-        if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            k_mem_segments = []
+            v_mem_segments = []
+            for depth_idx, state in enumerate(depth_memory):
+                state = state.to(x.dtype)
+                if state.size(1) != T:
+                    state = state[:, -T:, :]
+                if self.depth_embedding is not None:
+                    state = state + self.depth_embedding[depth_idx].view(1, 1, -1).to(state.dtype)
+                seg_k = self.c_k(state).view(B, T, self.n_kv_head, self.head_dim)
+                seg_v = self.c_v(state).view(B, T, self.n_kv_head, self.head_dim)
+                k_mem_segments.append(apply_rotary_emb(seg_k, cos, sin))
+                v_mem_segments.append(seg_v)
+
+            q, k = norm(q), norm(k)
+            q = q * 1.2
+            k = k * 1.2
+            k_mem = torch.cat([norm(seg) * 1.2 for seg in k_mem_segments], dim=1)
+            v_mem = torch.cat(v_mem_segments, dim=1)
+            k = torch.cat([k_mem, k], dim=1)
+            v = torch.cat([v_mem, v], dim=1)
+
+            # Build a causal mask over the flattened memory: each depth segment contributes
+            # tokens 0..t and is therefore valid for query index t.
+            total_keys = (len(depth_memory) + 1) * T
+            mask = torch.zeros(T, total_keys, device=x.device, dtype=torch.bool)
+            offsets = [0]
+            for _ in range(len(depth_memory) + 1):
+                offsets.append(offsets[-1] + T)
+            for t in range(T):
+                valid = []
+                for seg in range(len(depth_memory) + 1):
+                    start = offsets[seg]
+                    valid.extend(range(start, start + (t + 1)))
+                mask[t, valid] = True
+            q_sdpa = q.permute(0, 2, 1, 3).contiguous()
+            k_sdpa = k.permute(0, 2, 1, 3).contiguous()
+            v_sdpa = v.permute(0, 2, 1, 3).contiguous()
+            y = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, attn_mask=mask.unsqueeze(0).unsqueeze(0), is_causal=False)
+            y = y.permute(0, 2, 1, 3).contiguous().view(B, T, -1)
         else:
-            # Inference: use flash_attn_with_kvcache which handles cache management
-            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
-            y = flash_attn.flash_attn_with_kvcache(
-                q, k_cache, v_cache,
-                k=k, v=v,
-                cache_seqlens=kv_cache.cache_seqlens,
-                causal=True,
-                window_size=window_size,
-            )
-            # Advance position after last layer processes
-            if self.layer_idx == kv_cache.n_layers - 1:
-                kv_cache.advance(T)
+            # Apply Rotary Embeddings to queries and keys to get relative positional encoding
+            cos, sin = cos_sin
+            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+            q, k = norm(q), norm(k) # QK norm
+            q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
+            k = k * 1.2
+
+            # Flash Attention (FA3 or SDPA fallback)
+            # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
+            if kv_cache is None:
+                # Training: causal attention with optional sliding window
+                y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            else:
+                # Inference: use flash_attn_with_kvcache which handles cache management
+                k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+                y = flash_attn.flash_attn_with_kvcache(
+                    q, k_cache, v_cache,
+                    k=k, v=v,
+                    cache_seqlens=kv_cache.cache_seqlens,
+                    causal=True,
+                    window_size=window_size,
+                )
+                # Advance position after last layer processes
+                if self.layer_idx == kv_cache.n_layers - 1:
+                    kv_cache.advance(T)
+
+            # Re-assemble the heads and project back to residual stream
+            y = y.contiguous().view(B, T, -1)
 
         # Re-assemble the heads and project back to residual stream
-        y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
 
@@ -172,8 +230,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx, use_ve=use_ve)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, depth_memory=None):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, depth_memory=depth_memory)
         x = x + self.mlp(norm(x))
         return x
 
@@ -532,10 +590,16 @@ class GPT(nn.Module):
         x0 = x  # save initial normalized embedding for x0 residual
         backout_layer = self.backout_layer  # cache at the tap this model was trained with
         x_backout = None
+        depth_history = []
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            depth_memory = None
+            if self.config.depth_memory_layers > 0:
+                start = max(0, i - self.config.depth_memory_layers)
+                depth_memory = depth_history[start:i]
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, depth_memory=depth_memory)
+            depth_history.append(x)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
