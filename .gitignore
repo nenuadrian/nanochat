@@ -11,3 +11,6 @@ eval_bundle/
 # Local setup
 CLAUDE.md
 wandb/
+
+# Experiment logs (runs/growth_rl.sh)
+logs/

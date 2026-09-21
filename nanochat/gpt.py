@@ -37,6 +37,17 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # --- explicit per-layer structure -------------------------------------------
+    # Each of these defaults to the formula that n_layer implies, so a config that
+    # omits them (i.e. every checkpoint written before growth existed) builds the
+    # exact same model as before. nanochat/grow.py pins them when it inserts layers:
+    # all three are derived from n_layer, so re-deriving them at a new depth would
+    # silently move the value-embedding set, the backout tap and the window pattern
+    # of layers that were already trained. They must round-trip through the
+    # checkpoint or a grown model reloads as a different function.
+    ve_layers: tuple = ()      # () = derive via has_ve(i, n_layer)
+    backout_layer: int = -1    # -1 = n_layer // 2
+    window_layers: str = ""    # "" = tile window_pattern, final layer forced to L
 
 
 def norm(x):
@@ -54,6 +65,16 @@ def has_ve(layer_idx, n_layer):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
 
+def resolve_ve_layers(config):
+    """The set of layers carrying a value embedding: pinned if the config says so, else the formula."""
+    if config.ve_layers:
+        return {int(i) for i in config.ve_layers}
+    return {i for i in range(config.n_layer) if has_ve(i, config.n_layer)}
+
+def resolve_backout_layer(config):
+    """Which layer's output is cached and subtracted before the final norm."""
+    return config.backout_layer if config.backout_layer >= 0 else config.n_layer // 2
+
 def apply_rotary_emb(x, cos, sin):
     # note: this rotates by -theta, the transpose of the textbook convention. Functionally
     # equivalent (only the relative q/k rotation matters), kept for checkpoint compatibility.
@@ -65,7 +86,7 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, use_ve=None):
         super().__init__()
         self.layer_idx = layer_idx
         self.n_head = config.n_head
@@ -79,7 +100,11 @@ class CausalSelfAttention(nn.Module):
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 12
-        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        # use_ve is passed in because the has_ve formula keys off n_layer: a grown model
+        # must keep the assignment it was trained with, not the one its new depth implies.
+        if use_ve is None:
+            use_ve = has_ve(layer_idx, config.n_layer)
+        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if use_ve else None
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -142,9 +167,9 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, use_ve=None):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        self.attn = CausalSelfAttention(config, layer_idx, use_ve=use_ve)
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
@@ -170,9 +195,14 @@ class GPT(nn.Module):
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
+        self.padded_vocab_size = padded_vocab_size
+        # Resolved once here, not re-derived per forward: nanochat/grow.py changes n_layer
+        # in place, and these must keep describing the model that was actually trained.
+        self.ve_layer_set = resolve_ve_layers(config)
+        self.backout_layer = resolve_backout_layer(config)
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
+            "h": nn.ModuleList([Block(config, i, use_ve=(i in self.ve_layer_set)) for i in range(config.n_layer)]),
         })
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
@@ -189,7 +219,7 @@ class GPT(nn.Module):
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in sorted(self.ve_layer_set)})
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -304,6 +334,13 @@ class GPT(nn.Module):
             "L": (long_window, 0),
             "S": (short_window, 0),
         }
+        # A pinned per-layer string wins: it already has the final-layer override baked in,
+        # so re-tiling at a new depth cannot move which layers are short.
+        if config.window_layers:
+            chars = config.window_layers.upper()
+            assert len(chars) == config.n_layer, f"window_layers has {len(chars)} chars for {config.n_layer} layers"
+            assert all(c in "SL" for c in chars), f"Invalid window_layers: {chars}. Use only S and L."
+            return [char_to_window[c] for c in chars]
         # Tile pattern across layers
         window_sizes = []
         for layer_idx in range(config.n_layer):
@@ -493,8 +530,7 @@ class GPT(nn.Module):
 
         # Forward the trunk of the Transformer
         x0 = x  # save initial normalized embedding for x0 residual
-        n_layer = self.config.n_layer
-        backout_layer = n_layer // 2  # cache at halfway point
+        backout_layer = self.backout_layer  # cache at the tap this model was trained with
         x_backout = None
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0

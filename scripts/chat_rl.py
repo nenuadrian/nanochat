@@ -25,6 +25,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- --run=default
 
 import argparse
 import os
+import time
 import itertools
 import wandb
 import numpy as np
@@ -41,6 +42,9 @@ from nanochat.allocation import (
 )
 from nanochat.vip_gp import PromptSuccessGP
 from nanochat.tpo import tpo_weights
+from nanochat.grow import (
+    grow_depth, set_learning_rates, parse_schedule, capture_logits, new_layer_indices,
+)
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -60,6 +64,10 @@ parser.add_argument("--task", type=str, default="gsm8k",
                          "a budget allocator to allocate on. ARC is multiple-choice and lands "
                          "near p=0.5, where the allocators actually differ.")
 parser.add_argument("--num-epochs", type=int, default=1, help="number of epochs over the task")
+parser.add_argument("--max-steps", type=int, default=0,
+                    help="cap the horizon at N steps (0 = the full --num-epochs pass). The LR "
+                         "schedule and any --grow-at fractions are computed against the cap, so a "
+                         "short run is a complete run and not a truncated one")
 # Batch sizes / sampling
 parser.add_argument("--device-batch-size", type=int, default=8, help="max batch size per forward pass")
 parser.add_argument("--examples-per-step", type=int, default=16, help="total examples per optimization step across all ranks")
@@ -76,7 +84,7 @@ parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate
 parser.add_argument("--weight-decay", type=float, default=0.0, help="weight decay for embedding/unembedding parameters (Adam)")
 parser.add_argument("--init-lr-frac", type=float, default=0.05, help="initial LR as fraction of base LR")
 # Evaluation / checkpointing
-parser.add_argument("--eval-every", type=int, default=60, help="evaluate pass@k every N steps")
+parser.add_argument("--eval-every", type=int, default=60, help="evaluate pass@k every N steps (-1 = disable)")
 parser.add_argument("--eval-examples", type=int, default=400, help="number of examples for pass@k evaluation")
 # --- rollout budget allocation -------------------------------------------
 parser.add_argument("--allocator", type=str, default="uniform", choices=["uniform", "gvm", "vip"],
@@ -125,8 +133,63 @@ parser.add_argument("--tpo-epochs", type=int, default=1,
                     help="gradient epochs over each rollout batch. TPO's frozen target is a fixed "
                          "point, so reuse needs no PPO ratio or clip (paper 5.3); the paper reports "
                          "4 epochs converging ~5x earlier. Only valid with --objective tpo")
-parser.add_argument("--save-every", type=int, default=60, help="save checkpoint every N steps")
+parser.add_argument("--save-every", type=int, default=60, help="save checkpoint every N steps (-1 = disable)")
+parser.add_argument("--output-tag", type=str, default=None,
+                    help="subdirectory to write checkpoints into. Defaults to --model-tag, else "
+                         "d<initial depth>. Growth changes the depth mid-run, so without this "
+                         "a growing run would scatter checkpoints across d20/, d24/, ...")
+parser.add_argument("--seed", type=int, default=0,
+                    help="mixes into the rollout sampling seeds and shuffles the prompt order, so "
+                         "the same config can be run as several seeds. 0 reproduces the original "
+                         "(previously fixed, and therefore unseedable) rollout stream exactly")
+# --- capacity growth -----------------------------------------------------
+# Insert transformer blocks mid-RL. See nanochat/grow.py; the blocks are identity
+# at birth (zeroed c_proj), so reward is continuous across the seam by construction.
+parser.add_argument("--grow-at", type=str, default="",
+                    help="when to grow, comma separated. Values <1 are fractions of the run "
+                         "(e.g. '0.33,0.66'), whole numbers are absolute steps. Empty = never grow")
+parser.add_argument("--grow-layers", type=int, default=4, help="blocks inserted per growth event")
+parser.add_argument("--grow-position", type=str, default="middle",
+                    help="middle|start|end|<int>. middle by default: arXiv:2607.01232 finds RL's "
+                         "high-contribution layers concentrate mid-stack")
+parser.add_argument("--grow-init", type=str, default="copy", choices=["copy", "fresh", "random"],
+                    help="copy: clone the neighbour's features, zero its output projections "
+                         "(LLaMA Pro, function preserving); fresh: random features, still zeroed "
+                         "projections (also function preserving); random: projections random too, "
+                         "NOT function preserving -- the arm that tests reward dip-and-recover")
+parser.add_argument("--grow-ve", type=int, default=0,
+                    help="give grown layers a value embedding. Off by default: each VE table is "
+                         "vocab*kv_dim (16.8M on d20narrow) of sparse-gradient parameters that RL "
+                         "is poorly placed to train")
+parser.add_argument("--grow-lr-mult", type=float, default=50.0,
+                    help="learning rate multiplier for the grown parameters. At the base RL rate a "
+                         "Muon step moves a matrix ~1e-3 in spectral norm against a trained c_proj "
+                         "of ~5, so grown layers would never leave identity and the run would "
+                         "measure nothing. Set 1.0 to measure exactly that null")
+parser.add_argument("--grow-warmup", type=int, default=5,
+                    help="steps to ramp the grown groups' LR. Muon's step size is independent of "
+                         "gradient magnitude, so without this its first update hits a zero matrix "
+                         "at full size")
+parser.add_argument("--lr-bump-at", type=str, default="",
+                    help="raise the learning rate of the EXISTING parameters at these points "
+                         "(same format as --grow-at). This is the control arm for growth: it "
+                         "separates 'the extra capacity helped' from 'you turned the learning "
+                         "rate up a third of the way in'")
+parser.add_argument("--lr-bump-mult", type=float, default=1.0,
+                    help="multiplier applied at each --lr-bump-at point")
+parser.add_argument("--grow-eval-radius", type=int, default=3,
+                    help="force evaluations at g-1 .. g+N around each growth step. A transient you "
+                         "sample every --eval-every steps is a transient you cannot characterise")
+parser.add_argument("--grow-verify", type=int, default=1,
+                    help="log max|dlogits| on a fixed probe batch across each growth event. Should "
+                         "be ~0 for copy/fresh; this is the runtime form of the identity test")
+# --- diagnostics ---------------------------------------------------------
+parser.add_argument("--diag-every", type=int, default=0,
+                    help="every N steps, measure policy entropy, ReDo dormant-unit fraction, "
+                         "residual-stream effective rank and per-layer spectral norms on a fixed "
+                         "probe batch. 0 = off, which leaves the step cost exactly as it was")
 args = parser.parse_args()
+assert args.grow_lr_mult > 0, "--grow-lr-mult must be positive"
 if args.objective != "tpo":
     assert args.tpo_epochs == 1, "--tpo-epochs > 1 needs --objective tpo: the grpo path here has no " \
         "PPO ratio or clip, so reusing a rollout batch for it would be uncorrected off-policy"
@@ -168,7 +231,33 @@ else:
     train_task = ARC(subset=subset, split="train")
     val_task = ARC(subset=subset, split="test")
 print0(f"Task: {args.task} | train {len(train_task)} | val {len(val_task)} | max_new_tokens: {args.max_new_tokens}")
+
+def warn_if_checkpoint_dir_collides():
+    """The default checkpoint dirname is derived from depth alone, so two runs that differ
+    only in --objective or --task write the same files and the second silently wins. Check
+    the newest meta already there and say so loudly; --output-tag is the fix."""
+    import glob, json
+    dirname = args.output_tag or args.model_tag or f"d{model.config.n_layer}"
+    d = os.path.join(get_base_dir(), "chatrl_checkpoints", dirname)
+    metas = sorted(glob.glob(os.path.join(d, "meta_*.json")))
+    if not metas:
+        return
+    try:
+        prev = json.load(open(metas[-1])).get("user_config") or {}
+    except (OSError, json.JSONDecodeError):
+        return
+    clashes = {k: (prev.get(k), getattr(args, k)) for k in ("objective", "task")
+               if prev.get(k) is not None and prev.get(k) != getattr(args, k)}
+    if clashes:
+        desc = ", ".join(f"{k}: {was} -> {now}" for k, (was, now) in clashes.items())
+        print0(f"WARNING: {d} already holds checkpoints from a different run ({desc}). "
+               f"They will be OVERWRITTEN. Pass --output-tag to keep the arms separate.")
+    elif prev:
+        print0(f"NOTE: reusing checkpoint dir {d} (previous run: {prev.get('run')})")
+warn_if_checkpoint_dir_collides()
 num_steps = (len(train_task) // args.examples_per_step) * args.num_epochs
+if args.max_steps > 0:
+    num_steps = min(num_steps, args.max_steps)
 print0(f"Calculated number of steps: {num_steps}")
 print0(f"Objective: {args.objective}"
        + (f" (eta={args.tpo_eta}, anchor={bool(args.tpo_anchor)}, logp={args.tpo_logp}, "
@@ -186,7 +275,17 @@ alloc_min = args.alloc_min if args.alloc_min > 0 else (3 if args.allocator == "v
 # its GP, so its pool is capped -- and the cap is applied to EVERY allocator, or
 # uniform and GVM would see a larger prompt set than VIP and the comparison would
 # be confounded by data, not allocation.
+# Rollout seeds were previously a pure function of (step, prompt, chunk), i.e. fixed
+# across runs, so repeating a config gave a bit-identical run and there was no way to
+# get a second seed out of it. --seed mixes in here; seed 0 XORs with 0 and therefore
+# reproduces the original stream exactly.
+SEED_MIX = 0x9E3779B97F4A7C15
+def rollout_seed(*parts):
+    return (hash(parts) ^ (args.seed * SEED_MIX)) & 0x7FFFFFFF
+
 rank_indices = list(range(ddp_rank, len(train_task), ddp_world_size))
+if args.seed != 0:
+    np.random.default_rng(args.seed + 9973 * ddp_rank).shuffle(rank_indices)
 pool_cap = args.prompt_pool if args.prompt_pool > 0 else (
     args.vip_embed_prompts if args.allocator == "vip" else 0)
 if pool_cap > 0:
@@ -226,7 +325,7 @@ def gvm_pilot(example_idx, n_pilot, step):
     seqs, _ = engine.generate_batch(
         toks, num_samples=n_pilot, max_tokens=args.max_new_tokens,
         temperature=args.temperature, top_k=args.top_k,
-        seed=hash(("pilot", step, int(example_idx))) & 0x7FFFFFFF,
+        seed=rollout_seed(-1, step, int(example_idx)),   # -1 marks the pilot stream
     )
     correct = []
     for seq in seqs:
@@ -354,7 +453,7 @@ def rollout_one(example_idx, n_rollouts, step, assistant_end):
     chunk_idx = 0
     while remaining > 0:
         take = min(remaining, args.device_batch_size)
-        seed = hash((step, int(example_idx), chunk_idx)) & 0x7FFFFFFF
+        seed = rollout_seed(step, int(example_idx), chunk_idx)
         s_batch, m_batch = engine.generate_batch(
             tokens, num_samples=take, max_tokens=args.max_new_tokens,
             temperature=args.temperature, top_k=args.top_k, seed=seed,
@@ -459,7 +558,8 @@ def run_task_eval(task, tokenizer, engine,
     num_samples=1,
     max_completion_tokens=256,
     temperature=0.0,
-    top_k=50
+    top_k=50,
+    seed=1234,
 ):
     """
     Evaluates the task and returns a list of records of evaluation outcomes.
@@ -474,12 +574,18 @@ def run_task_eval(task, tokenizer, engine,
         prefix_length = len(tokens)
         # Generate k samples using batched generation inside the Engine
         assert num_samples <= args.device_batch_size # usually this is true. we can add a loop if not...
+        # Engine.generate re-seeds a fresh Generator on every call, so leaving the seed
+        # at its default makes every example share one random stream: row i always draws
+        # the i-th variate of the same sequence. That turns pass@1 into a fixed-quantile
+        # probe rather than a sample (it reliably picks tail tokens, scoring below chance),
+        # and correlates the rows so pass@k plateaus. Vary the seed per example.
         generated_token_sequences, masks = engine.generate_batch(
             tokens,
             num_samples=num_samples,
             max_tokens=max_completion_tokens,
             temperature=temperature,
-            top_k=top_k
+            top_k=top_k,
+            seed=seed + idx,
         )
         # Check each sample for correctness
         outcomes = []
@@ -518,6 +624,131 @@ def get_lr_multiplier(it):
     lrm = 1.0 - it / num_steps
     return lrm
 
+# -----------------------------------------------------------------------------
+# Capacity growth + diagnostics
+
+initial_depth = model.config.n_layer   # pinned: model.config.n_layer moves when we grow
+grow_steps = parse_schedule(args.grow_at, num_steps)
+lr_bump_steps = parse_schedule(args.lr_bump_at, num_steps)
+if lr_bump_steps:
+    print0(f"LR bump schedule: steps {lr_bump_steps} | existing params x{args.lr_bump_mult}")
+grow_events = []                       # one info dict per growth event, for logging and meta
+grow_rng = torch.Generator(device="cpu").manual_seed(args.seed + 7919)
+if grow_steps:
+    print0(f"Growth schedule: steps {grow_steps} | +{args.grow_layers} layers at '{args.grow_position}' "
+           f"| init={args.grow_init} | ve={'on' if args.grow_ve else 'off'} "
+           f"| lr x{args.grow_lr_mult} (warmup {args.grow_warmup})")
+# Evaluate on both sides of every growth event, not just on the --eval-every grid.
+forced_eval_steps = set()
+for g in grow_steps + lr_bump_steps:
+    forced_eval_steps.update(x for x in range(g - 1, g + args.grow_eval_radius + 1) if 0 <= x < num_steps)
+
+def build_probe(task, n=4, max_len=128):
+    """A small fixed batch of real prompts, for growth verification and diagnostics."""
+    pad = tokenizer.encode_special("<|assistant_end|>")
+    seqs = [tokenizer.render_for_completion(task[i])[-max_len:] for i in range(min(n, len(task)))]
+    width = max(len(x) for x in seqs)
+    return torch.tensor([[pad] * (width - len(x)) + x for x in seqs], dtype=torch.long, device=device)
+
+probe_ids = build_probe(val_task) if (args.grow_verify or args.diag_every > 0) else None
+
+@torch.no_grad()
+def measure_diagnostics(ids):
+    """Plasticity instrumentation, on a fixed probe batch so it is comparable over time.
+
+    Reward alone will not separate these arms; the mechanism the growth literature
+    actually claims (Neuroplastic Expansion, ICLR 2025) is plasticity, whose signature
+    in LLM RL is entropy collapse plus accumulating dormant units.
+    """
+    acts, resid, handles = {}, {}, []
+    for i, b in enumerate(model.transformer.h):
+        def hook(mod, inp, out, i=i):
+            acts[i] = torch.relu(out).square().abs().mean(dim=(0, 1))  # the MLP hidden activation
+        handles.append(b.mlp.c_fc.register_forward_hook(hook))
+    handles.append(model.lm_head.register_forward_hook(lambda m, inp, out: resid.__setitem__("x", inp[0].detach())))
+    was_training = model.training
+    model.eval()
+    try:
+        logits = model(ids)
+    finally:
+        for h in handles:
+            h.remove()
+        if was_training:
+            model.train()
+
+    out = {}
+    logprobs = logits.log_softmax(dim=-1)
+    per_pos = -(logprobs.exp() * logprobs).sum(-1)          # (B, T)
+    # The probe ends at <|assistant_start|>, so the final position is the first token
+    # the policy would emit -- on ARC that IS the answer letter. This is the
+    # distribution RL collapses; averaging over all positions instead buries it under
+    # generic text prediction, which barely moves (measured: 1.33 vs 1.68 on the SFT
+    # model, where the decision is near-uniform over 4 choices, ln 4 = 1.386).
+    out["diag/entropy_decision"] = float(per_pos[:, -1].mean())
+    out["diag/entropy_allpos"] = float(per_pos.mean())
+    # ReDo dormancy: unit i is dormant when its mean activation is a negligible
+    # share of the layer's mean. Ref: Sokar et al. 2023.
+    tau = 0.025
+    grown = set(new_layer_indices(grow_events, model.config.n_layer))
+    fracs, new_fracs = [], []
+    for i, a in acts.items():
+        frac = float((a / a.mean().clamp(min=1e-12) <= tau).float().mean())
+        fracs.append(frac)
+        if i in grown:
+            new_fracs.append(frac)
+    if fracs:
+        out["diag/dormant_frac"] = sum(fracs) / len(fracs)
+        out["diag/dormant_frac_max"] = max(fracs)
+    if new_fracs:
+        out["diag/dormant_frac_new"] = sum(new_fracs) / len(new_fracs)
+    # Effective rank (exp of the entropy of the normalised spectrum) of the residual
+    # stream entering the lm_head. On CPU: MPS has patchy linalg coverage.
+    x = resid["x"].reshape(-1, resid["x"].size(-1)).float().cpu()
+    x = x - x.mean(dim=0, keepdim=True)
+    sv = torch.linalg.svdvals(x)
+    q = sv / sv.sum().clamp(min=1e-12)
+    out["diag/effective_rank"] = float(torch.exp(-(q * (q + 1e-12).log()).sum()))
+    # Spectral norms: the direct answer to "did the grown capacity ever engage?"
+    old_s, new_s = [], []
+    for i, b in enumerate(model.transformer.h):
+        v = float(torch.linalg.matrix_norm(b.mlp.c_proj.weight.detach().float().cpu(), ord=2))
+        (new_s if i in grown else old_s).append(v)
+    if old_s:
+        out["diag/c_proj_spectral_old"] = sum(old_s) / len(old_s)
+    if new_s:
+        out["diag/c_proj_spectral_new"] = sum(new_s) / len(new_s)
+    return out
+
+@torch.no_grad()
+def weight_and_grad_stats():
+    """Cheap per-step stats: Frobenius norms of the output projections, split old vs
+    grown, and gradient norms per optimizer group. Accumulated on device, one sync."""
+    grown = set(new_layer_indices(grow_events, model.config.n_layer))
+    old_n, new_n_ = [], []
+    for i, b in enumerate(model.transformer.h):
+        v = b.mlp.c_proj.weight.detach().float().norm()
+        (new_n_ if i in grown else old_n).append(v)
+    out = {}
+    if old_n:
+        out["weights/c_proj_fro_old"] = float(torch.stack(old_n).mean())
+    if new_n_:
+        out["weights/c_proj_fro_new"] = float(torch.stack(new_n_).mean())
+    return out
+
+@torch.no_grad()
+def grad_norm_stats():
+    total = torch.zeros((), device=device)
+    grown = torch.zeros((), device=device)
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            sq = p.grad.detach().float().pow(2).sum()
+            total += sq
+            if group.get("grown_at") is not None:
+                grown += sq
+    return {"grad/norm_total": float(total.sqrt()), "grad/norm_grown": float(grown.sqrt())}
+
 # Calculate the number of examples each rank handles to achieve the desired examples_per_step
 print0(f"Total sequences per step: {args.examples_per_step * args.num_samples}") # total batch size in sequences/step
 assert args.examples_per_step % ddp_world_size == 0, "Desired examples per step must be divisible by the number of ranks"
@@ -527,9 +758,14 @@ print0(f"Calculated examples per rank: {examples_per_rank}")
 # Kick off the training loop
 batch_iterator = get_step_batches()
 for step in range(num_steps):
+    step_t0 = time.time()
 
-    # Evaluate the model once in a while and log to wandb
-    if step % args.eval_every == 0:
+    # Evaluate the model once in a while and log to wandb. Growth events are
+    # additionally bracketed, so the transient is sampled densely enough to see.
+    # --eval-every <= 0 means no evaluation at all; growth bracketing densifies the
+    # grid, it does not re-enable a grid the user turned off.
+    do_eval = args.eval_every > 0 and (step % args.eval_every == 0 or step in forced_eval_steps)
+    if do_eval:
         model.eval()
         passk = torch.zeros(args.device_batch_size, device=device) # pass@k for k=1..device_batch_size
         records_iter = run_task_eval(val_task, tokenizer, engine, num_samples=args.device_batch_size, max_examples=args.eval_examples, temperature=1.0, max_completion_tokens=args.max_new_tokens)
@@ -544,10 +780,59 @@ for step in range(num_steps):
         print_passk = [f"Pass@{k}: {passk[k - 1].item():.4f}" for k in range(1, args.device_batch_size + 1)]
         print0(f"Step {step} | {', '.join(print_passk)}")
         log_passk = {f"pass@{k}": passk[k - 1].item() for k in range(1, args.device_batch_size + 1)}
+        # Sampling diversity. On a measured 140-step GRPO run this fell 0.71 -> 0.37
+        # while pass@1 rose only 0.26 -> 0.31: the policy is mostly being sharpened,
+        # not made more capable. It is the clearest plasticity signal this task offers.
+        log_passk["passk/diversity_gap"] = passk[-1].item() - passk[0].item()
+        print0(f"Step {step} | diversity gap (pass@{args.device_batch_size} - pass@1): "
+               f"{log_passk['passk/diversity_gap']:.4f}")
         wandb_run.log({
             "step": step,
             **log_passk,
         })
+
+    train_t0 = time.time()   # excludes the eval above: the grown arms get extra forced
+                             # evals from the bracket, which would otherwise show up as
+                             # the grown model being slower
+    # Grow the model, before this step's rollouts are drawn so they come from the
+    # grown policy. With --grow-init copy/fresh the inserted blocks are exactly the
+    # identity, so nothing about the policy changes here; --grow-verify asserts that
+    # rather than assuming it.
+    grow_metrics = {}
+    if step in lr_bump_steps:
+        # Only the pre-existing groups: a grown group already carries --grow-lr-mult,
+        # and bumping it too would confound the two knobs.
+        bumped = 0
+        for group in optimizer.param_groups:
+            if group.get("grown_at") is None:
+                group["initial_lr"] *= args.lr_bump_mult
+                bumped += 1
+        print0(f"[lr-bump] step {step}: x{args.lr_bump_mult} on {bumped} existing param groups")
+        grow_metrics["lr_bump/event"] = 1.0
+    if step in grow_steps:
+        before_logits = capture_logits(model, probe_ids) if args.grow_verify else None
+        info = grow_depth(
+            model, optimizer, args.grow_layers,
+            position=args.grow_position, init=args.grow_init, add_ve=bool(args.grow_ve),
+            lr_mult=args.grow_lr_mult, warmup=args.grow_warmup, step=step, generator=grow_rng,
+        )
+        grow_events.append(info)
+        grow_metrics = {
+            "grow/event": 1.0,
+            "grow/n_layer": float(info["n_layer_after"]),
+            "grow/total_params_M": info["total_params"] / 1e6,
+            "grow/new_params_M": info["new_params"] / 1e6,
+        }
+        if before_logits is not None:
+            after_logits = capture_logits(model, probe_ids)
+            delta = float((after_logits - before_logits).abs().max())
+            grow_metrics["grow/logit_delta_max"] = delta
+            preserving = args.grow_init in ("copy", "fresh")
+            print0(f"[grow] max|dlogits| across the seam: {delta:.3e}"
+                   + ("  (expected ~0)" if preserving else "  (init=random, perturbation intended)"))
+            if preserving and delta > 1e-3:
+                print0(f"[grow] WARNING: --grow-init {args.grow_init} is supposed to preserve the "
+                       f"function but moved the logits by {delta:.3e}. Treat this run as suspect.")
 
     # Forward/Backward on rollouts. One step = one allocation decision over
     # `examples_per_rank` prompts, then n_i rollouts for each of them.
@@ -582,6 +867,13 @@ for step in range(num_steps):
         for k in raw:
             inv_np[k] = raw[k] / mass
 
+    # Mean -log pi(sampled token) over the step: a Monte-Carlo estimate of the policy's
+    # token entropy, free because logp is computed for the objective anyway. Biased by
+    # top-k truncation, so it is a trend proxy; --diag-every measures true entropy.
+    logp_accum = torch.zeros((), device=device)
+    token_accum = torch.zeros((), device=device)
+
+    grad_metrics = {}
     n_prompts = max(len(records), 1)
     # TPO's target is a fixed point of its own update, so a rollout batch can be
     # reused for more gradient epochs with no PPO ratio and no clip: q stays
@@ -609,6 +901,11 @@ for step in range(num_steps):
                 b1 = min(b0 + args.device_batch_size, total_rows)
                 inputs, targets = inputs_all[b0:b1], targets_all[b0:b1]
                 logp = -model(inputs, targets, loss_reduction='none').view_as(inputs)  # (B, T)
+                if inner_epoch == 0:
+                    with torch.no_grad():
+                        # exactly 0 at ignore_index positions, so this sums over scored tokens only
+                        logp_accum += logp.detach().sum()
+                        token_accum += (targets >= 0).sum()
                 if args.objective == "tpo":
                     # Surrogate for -sum_i q_i log p_i^theta. Its gradient wrt a
                     # sequence log-prob is exactly p_i^theta - q_i, so the group
@@ -640,8 +937,9 @@ for step in range(num_steps):
         # Update the model parameters. Every rank runs this the same number of
         # times per step -- the optimizer all-reduces gradients inside step(), so
         # a rank that skipped one would hang the others.
-        for group in optimizer.param_groups:
-            group["lr"] = group["initial_lr"] * lrm
+        set_learning_rates(optimizer, step, lrm)
+        if inner_epoch == args.tpo_epochs - 1:
+            grad_metrics = grad_norm_stats()   # measured on the gradient actually stepped on
         optimizer.step()
         model.zero_grad(set_to_none=True)
 
@@ -673,11 +971,40 @@ for step in range(num_steps):
         dist.all_reduce(mean_sequence_length_tensor, op=dist.ReduceOp.AVG)
         mean_reward = mean_reward_tensor.item()
         mean_sequence_length = mean_sequence_length_tensor.item()
-    print0(f"Step {step}/{num_steps} | Average reward: {mean_reward} | Average sequence length: {mean_sequence_length:.2f}")
+    # Entropy proxy, and the capacity/cost bookkeeping that makes the arms comparable
+    # on something other than steps: growth raises the per-step cost, so an equal-steps
+    # comparison quietly hands the grown arms more compute.
+    n_tokens_scored = float(token_accum)
+    neg_logp_mean = float(logp_accum) / max(n_tokens_scored, 1.0)
+    diag_metrics = {}
+    if args.diag_every > 0 and (step % args.diag_every == 0 or step in forced_eval_steps):
+        diag_metrics = measure_diagnostics(probe_ids)
+        print0(f"Step {step} | diag | entropy {diag_metrics['diag/entropy_decision']:.3f} "
+               f"| dormant {diag_metrics['diag/dormant_frac']:.3f} "
+               f"| eff_rank {diag_metrics['diag/effective_rank']:.1f} "
+               f"| c_proj spec old {diag_metrics.get('diag/c_proj_spectral_old', float('nan')):.3f}"
+               + (f" new {diag_metrics['diag/c_proj_spectral_new']:.3f}"
+                  if 'diag/c_proj_spectral_new' in diag_metrics else ""))
+    now = time.time()
+    step_seconds, train_seconds = now - step_t0, now - train_t0
+    print0(f"Step {step}/{num_steps} | Average reward: {mean_reward} "
+           f"| Average sequence length: {mean_sequence_length:.2f} | {train_seconds:.1f}s")
     wandb_run.log({
         "step": step,
         "reward": mean_reward,
         "sequence_length": mean_sequence_length,
+        # -mean log pi over sampled tokens: entropy proxy, higher = less collapsed
+        "policy/neg_logp_mean": neg_logp_mean,
+        "policy/tokens_scored": n_tokens_scored,
+        "model/n_layer": float(model.config.n_layer),
+        "model/params_M": sum(p.numel() for p in model.parameters()) / 1e6,
+        "model/flops_per_token": float(model.estimate_flops()),
+        "cost/step_seconds": step_seconds,     # including evaluation
+        "cost/train_seconds": train_seconds,   # rollouts + backward only; use this to match compute
+        **grad_metrics,
+        **weight_and_grad_stats(),
+        **grow_metrics,
+        **diag_metrics,
         "allocator": args.allocator,
         "objective": args.objective,
         "empty_rank": float(empty_rank),
@@ -695,10 +1022,11 @@ for step in range(num_steps):
     })
 
     # Master process saves the model once in a while. Skip first step. Save last step.
-    if master_process and ((step > 0 and step % args.save_every == 0) or step == num_steps - 1):
+    if master_process and args.save_every > 0 and ((step > 0 and step % args.save_every == 0) or step == num_steps - 1):
         base_dir = get_base_dir()
-        depth = model.config.n_layer
-        output_dirname = args.model_tag if args.model_tag else f"d{depth}" # base the model tag on the depth of the base model
+        # Pinned to the depth the run STARTED at: model.config.n_layer moves when the
+        # model grows, which would scatter one run's checkpoints across several dirs.
+        output_dirname = args.output_tag or args.model_tag or f"d{initial_depth}"
         checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", output_dirname)
         model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
         save_checkpoint(
@@ -708,6 +1036,9 @@ for step in range(num_steps):
             None, # note: we don't bother to save the optimizer state
             {
                 "model_config": model_config_kwargs,
+                "grow_events": grow_events,
+                "initial_depth": initial_depth,
+                "user_config": user_config, # so a checkpoint records which arm produced it
             }
         )
         print(f"✅ Saved model checkpoint to {checkpoint_dir}")
