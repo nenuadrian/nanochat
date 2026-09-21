@@ -32,6 +32,7 @@ import wandb
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
@@ -89,8 +90,8 @@ parser.add_argument("--matrix-optimizer", type=str, default="muon", choices=["mu
 parser.add_argument("--layer-optimizers", type=str, default="", help="per-block matrix optimizer layout: sophia-middle, or e.g. muon*4,sophia*12,adamw*4")
 parser.add_argument("--sophia-lr", type=float, default=1e-4, help="Sophia-G learning rate for Sophia-assigned blocks")
 parser.add_argument("--sophia-rho", type=float, default=0.04, help="Sophia-G clipping parameter rho")
-parser.add_argument("--sophia-hessian-update-interval", type=int, default=10, help="refresh Sophia curvature every N optimizer steps")
-parser.add_argument("--sophia-batch-size", type=int, default=-1, help="examples represented by a Sophia gradient; -1 uses --examples-per-step")
+parser.add_argument("--sophia-hessian-update-interval", type=int, default=10, help="refresh Sophia sampled-label GNB curvature every N optimizer steps")
+parser.add_argument("--sophia-batch-size", type=int, default=-1, help="tokens in the Sophia curvature batch; -1 uses the sampled rollout batch")
 parser.add_argument("--weight-decay", type=float, default=0.0, help="weight decay for transformer matrix parameters")
 parser.add_argument("--init-lr-frac", type=float, default=0.05, help="initial LR as fraction of base LR")
 # Evaluation / checkpointing
@@ -644,7 +645,7 @@ sophia_batch_size = args.examples_per_step if args.sophia_batch_size == -1 else 
 if sophia_batch_size <= 0:
     raise ValueError("--sophia-batch-size must be positive or -1 for automatic resolution")
 if args.matrix_optimizer == "sophia" or args.layer_optimizers:
-    print0(f"Sophia-G batch size: {sophia_batch_size} examples")
+    print0(f"Sophia-G curvature batch: dynamic sampled rollout tokens (initial value: {sophia_batch_size})")
 optimizer = model.setup_optimizer(
     unembedding_lr=args.unembedding_lr,
     embedding_lr=args.embedding_lr,
@@ -918,6 +919,8 @@ for step in range(num_steps):
     token_accum = torch.zeros((), device=device)
 
     grad_metrics = {}
+    sophia_hessian_refreshed = False
+    sophia_curvature_inputs = None
     n_prompts = max(len(records), 1)
     # TPO's target is a fixed point of its own update, so a rollout batch can be
     # reused for more gradient epochs with no PPO ratio and no clip: q stays
@@ -944,6 +947,8 @@ for step in range(num_steps):
                 b0 = pass_idx * args.device_batch_size
                 b1 = min(b0 + args.device_batch_size, total_rows)
                 inputs, targets = inputs_all[b0:b1], targets_all[b0:b1]
+                if sophia_curvature_inputs is None:
+                    sophia_curvature_inputs = inputs.detach()
                 logp = -model(inputs, targets, loss_reduction='none').view_as(inputs)  # (B, T)
                 if inner_epoch == 0:
                     with torch.no_grad():
@@ -986,6 +991,24 @@ for step in range(num_steps):
             grad_metrics = grad_norm_stats()   # measured on the gradient actually stepped on
         optimizer.step()
         model.zero_grad(set_to_none=True)
+        if optimizer.should_update_sophia_hessian():
+            # Every rank must participate in the optimizer's gradient all-reduce.
+            # If a rank has no rollout data this step, defer the refresh instead of
+            # injecting a synthetic batch into the GNB estimate.
+            have_inputs = torch.tensor(int(sophia_curvature_inputs is not None), device=device)
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(have_inputs, op=dist.ReduceOp.MIN)
+            if have_inputs.item():
+                optimizer.set_sophia_batch_size(sophia_curvature_inputs.numel() * ddp_world_size)
+                curvature_logits = model(sophia_curvature_inputs)
+                sampled_targets = torch.distributions.Categorical(logits=curvature_logits).sample()
+                curvature_loss = F.cross_entropy(
+                    curvature_logits.flatten(0, 1), sampled_targets.flatten(), reduction="mean",
+                )
+                curvature_loss.backward()
+                optimizer.update_sophia_hessian()
+                model.zero_grad(set_to_none=True)
+                sophia_hessian_refreshed = True
 
     # VIP's GP learns from the rollouts we were drawing anyway -- no extra cost.
     # Calibration is logged BEFORE the update, so it scores a genuine prediction
@@ -1052,11 +1075,13 @@ for step in range(num_steps):
         "allocator": args.allocator,
         "objective": args.objective,
         "empty_rank": float(empty_rank),
+        "sophia/hessian_refreshed": float(sophia_hessian_refreshed),
         # Rows pushed through the extra no-grad forward TPO needs to read p^old
         # (and p^theta again on every extra gradient epoch). Roughly one extra
         # forward per rollout per epoch, and not charged to the rollout budget --
         # same reason rollout_accounting exists for GVM's pilot pass.
         "tpo/scoring_rows": float(tpo_forward_rows - rows_before),
+        **(optimizer.sophia_metrics() if optimizer.has_sophia() else {}),
         **alloc_metrics,
     })
 

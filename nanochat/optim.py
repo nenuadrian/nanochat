@@ -125,12 +125,12 @@ def adamw_step_fused(
 
 # -----------------------------------------------------------------------------
 """
-Sophia-G, the gradient-square (Gauss-Newton-Bartlett) form of Sophia.
+Sophia-G, using the Gauss-Newton-Bartlett estimate from the Sophia paper.
 https://arxiv.org/abs/2305.14342
 
-The curvature estimate is refreshed every ``hessian_update_interval`` optimizer
-steps. It is a gradient-square proxy rather than an exact Hessian diagonal, which
-keeps this compatible with nanochat's ordinary single-backward training loop.
+The normal optimizer step consumes the task gradient. Curvature is refreshed by
+``MuonAdamW.update_sophia_hessian`` from a separate sampled-label backward pass;
+callers schedule that pass every ``hessian_update_interval`` steps.
 """
 
 @torch.compile(dynamic=False, fullgraph=True)
@@ -146,9 +146,8 @@ def sophia_step_fused(
     batch_size_t: Tensor,
     eps_t: Tensor,
     wd_t: Tensor,
-    update_hessian: bool,
 ) -> None:
-    """One fused Sophia-G step with decoupled weight decay and clipped updates."""
+    """One fused Sophia-G parameter step with decoupled weight decay."""
     # Keep optimizer math in fp32. Some embedding-like tensors are bf16 and the
     # curvature accumulator needs substantially more range than bf16 arithmetic.
     p32 = p.float()
@@ -158,10 +157,9 @@ def sophia_step_fused(
 
     p32.mul_(1 - lr_t * wd_t)
     exp_avg32.lerp_(grad32, 1 - beta1_t)
-    if update_hessian:
-        hessian32.lerp_(grad32.square(), 1 - beta2_t)
 
     # This matches Sophia-G's |m| / (rho * batch_size * h) <= 1 clipping.
+    # ``hessian`` is updated separately from a sampled-label GNB backward pass.
     denom = rho_t * batch_size_t * hessian32 + eps_t
     update = (exp_avg32.abs() / denom).clamp(max=1.0) * exp_avg32.sign()
     p32.add_(update, alpha=-lr_t)
@@ -368,8 +366,9 @@ class MuonAdamW(torch.optim.Optimizer):
             - For Sophia groups: 'lr', 'betas', 'rho', 'batch_size',
               'hessian_update_interval', 'eps', 'weight_decay'
 
-    Sophia groups use the Sophia-G gradient-square curvature proxy. ``batch_size``
-    is the number of sequences represented by the averaged gradient, not tokens.
+    Sophia groups use the sampled-label Gauss-Newton-Bartlett curvature estimate
+    from Sophia-G. ``batch_size`` is the number of tokens in that sampled-label
+    curvature batch.
     """
     def __init__(self, param_groups: list[dict]):
         super().__init__(param_groups, defaults={})
@@ -398,6 +397,7 @@ class MuonAdamW(torch.optim.Optimizer):
         self._sophia_batch_size_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._sophia_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._sophia_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._sophia_hessian_updates = 0
         self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
@@ -512,9 +512,6 @@ class MuonAdamW(torch.optim.Optimizer):
                 state['exp_avg'] = torch.zeros_like(p_slice)
                 state['hessian'] = torch.zeros_like(p_slice)
             state['step'] += 1
-            interval = group['hessian_update_interval']
-            update_hessian = state['step'] == 1 or state['step'] % interval == 0
-
             self._sophia_lr_t.fill_(group['lr'])
             self._sophia_beta1_t.fill_(group['betas'][0])
             self._sophia_beta2_t.fill_(group['betas'][1])
@@ -526,7 +523,7 @@ class MuonAdamW(torch.optim.Optimizer):
                 p_slice, grad_slice, state['exp_avg'], state['hessian'],
                 self._sophia_lr_t, self._sophia_beta1_t, self._sophia_beta2_t,
                 self._sophia_rho_t, self._sophia_batch_size_t, self._sophia_eps_t,
-                self._sophia_wd_t, update_hessian,
+                self._sophia_wd_t,
             )
 
             if not pinfo['is_small']:
@@ -635,3 +632,137 @@ class MuonAdamW(torch.optim.Optimizer):
 
         # Phase 3: wait for gathers, copy back
         self._finish_gathers(gather_list)
+
+    def has_sophia(self) -> bool:
+        """Whether this optimizer owns any Sophia-assigned parameter groups."""
+        return any(group['kind'] == 'sophia' for group in self.param_groups)
+
+    def set_sophia_batch_size(self, batch_size: int) -> None:
+        """Set the token count represented by the next sampled-label GNB batch."""
+        if batch_size <= 0:
+            raise ValueError(f"Sophia batch_size must be positive, got {batch_size}")
+        for group in self.param_groups:
+            if group['kind'] == 'sophia':
+                group['batch_size'] = batch_size
+
+    @torch.no_grad()
+    def should_update_sophia_hessian(self) -> bool:
+        """Return whether the completed Sophia step reached its refresh interval."""
+        for group in self.param_groups:
+            if group['kind'] != 'sophia':
+                continue
+            for p in group['params']:
+                state = self.state[p]
+                if state and state['step'] % group['hessian_update_interval'] == 0:
+                    return True
+        return False
+
+    @torch.no_grad()
+    def update_sophia_hessian(self) -> None:
+        """Update Sophia's GNB estimate from sampled-label gradients.
+
+        The caller must populate gradients with a *separate* backward pass whose
+        labels were sampled from the model distribution. This is deliberately not
+        folded into ``step``: doing so would silently substitute the task gradient
+        and turn Sophia-G into a cheaper, different squared-gradient optimizer.
+        """
+        if not self.has_sophia():
+            return
+        if dist.is_available() and dist.is_initialized():
+            world_size = dist.get_world_size()
+        else:
+            world_size = 1
+        rank = dist.get_rank() if world_size > 1 else 0
+
+        updated = False
+        for group in self.param_groups:
+            if group['kind'] != 'sophia':
+                continue
+            beta2 = group['betas'][1]
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                # The ordinary optimizer path reduce-scatters its gradients. This
+                # extra pass is infrequent, so all-reducing the sampled gradient is
+                # clearer and gives each rank the same global GNB estimate before
+                # storing its normal ZeRO-style state shard.
+                grad = p.grad
+                if world_size > 1:
+                    dist.all_reduce(grad, op=dist.ReduceOp.SUM)
+                    grad.div_(world_size)
+
+                if p.numel() < 1024:
+                    hessian_slice = p
+                    grad_slice = grad
+                else:
+                    rank_size = p.shape[0] // world_size
+                    hessian_slice = p[rank * rank_size:(rank + 1) * rank_size]
+                    grad_slice = grad[rank * rank_size:(rank + 1) * rank_size]
+
+                state = self.state[p]
+                if not state:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(hessian_slice)
+                    state['hessian'] = torch.zeros_like(hessian_slice)
+                elif 'hessian' not in state:
+                    state['hessian'] = torch.zeros_like(hessian_slice)
+                state['hessian'].mul_(beta2).addcmul_(
+                    grad_slice.float(), grad_slice.float(), value=1 - beta2,
+                )
+                updated = True
+        if updated:
+            self._sophia_hessian_updates += 1
+
+    @torch.no_grad()
+    def sophia_metrics(self) -> dict[str, float]:
+        """Return aggregate diagnostics for Sophia groups, synchronized by rank."""
+        if not self.has_sophia():
+            return {}
+
+        totals = None
+        layer_indices = set()
+        for group in self.param_groups:
+            if group['kind'] != 'sophia':
+                continue
+            layer_indices.update(group.get('layer_indices', ()))
+            for p in group['params']:
+                state = self.state[p]
+                if not state or 'hessian' not in state:
+                    continue
+                hessian = state['hessian'].float()
+                exp_avg = state['exp_avg'].float()
+                ratio = exp_avg.abs() / (group['rho'] * group['batch_size'] * hessian + group['eps'])
+                update = ratio.clamp(max=1.0)
+                if totals is None:
+                    totals = torch.zeros(6, device=hessian.device, dtype=torch.float32)
+                totals[0] += hessian.sum(dtype=torch.float32)
+                totals[1] += hessian.square().sum(dtype=torch.float32)
+                totals[2] += (group['lr'] * update).square().sum(dtype=torch.float32)
+                totals[3] += (ratio >= 1.0).sum(dtype=torch.float32)
+                totals[4] += hessian.numel()
+                totals[5] += group['lr'] * hessian.numel()
+
+        if totals is None:
+            # This is only possible before a Sophia parameter has seen a gradient.
+            return {
+                'sophia/layer_count': float(len(layer_indices)),
+                'sophia/hessian_updates': float(self._sophia_hessian_updates),
+            }
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+
+        count = totals[4].item()
+        if count == 0:
+            return {
+                'sophia/layer_count': float(len(layer_indices)),
+                'sophia/hessian_updates': float(self._sophia_hessian_updates),
+            }
+        return {
+            'sophia/layer_count': float(len(layer_indices)),
+            'sophia/hessian_updates': float(self._sophia_hessian_updates),
+            'sophia/effective_lr': totals[5].item() / count,
+            'sophia/curvature_mean': totals[0].item() / count,
+            'sophia/curvature_rms': (totals[1].item() / count) ** 0.5,
+            'sophia/update_rms': (totals[2].item() / count) ** 0.5,
+            'sophia/clipped_fraction': totals[3].item() / count,
+        }

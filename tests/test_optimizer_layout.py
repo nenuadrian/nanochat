@@ -1,10 +1,11 @@
 """CPU tests for depth-wise transformer optimizer assignment."""
 
 import pytest
+import torch
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.grow import grow_depth
-from nanochat.optim import resolve_layer_optimizers
+from nanochat.optim import MuonAdamW, resolve_layer_optimizers
 
 
 def make_model(depth=6):
@@ -65,3 +66,25 @@ def test_grown_blocks_inherit_the_adjacent_matrix_optimizer(kind):
     grown_groups = [group for group in optimizer.param_groups if group.get("grow_tag") == "new_matrix"]
     assert grown_groups
     assert {group["kind"] for group in grown_groups} == {kind}
+
+
+def test_sampled_label_hessian_update_and_metrics_work_on_cpu():
+    """The extra Sophia curvature path must not reuse the normal task gradient."""
+    p = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
+    optimizer = MuonAdamW([dict(
+        kind="sophia", params=[p], lr=1e-3, betas=(0.965, 0.9), rho=0.04,
+        batch_size=16, hessian_update_interval=10, eps=1e-15, weight_decay=0.0,
+        layer_indices=(2, 3),
+    )])
+    p.grad = torch.tensor([1.0, -2.0])
+    optimizer.update_sophia_hessian()
+
+    torch.testing.assert_close(optimizer.state[p]["hessian"], torch.tensor([0.1, 0.4]))
+    metrics = optimizer.sophia_metrics()
+    assert metrics["sophia/layer_count"] == 2
+    assert metrics["sophia/hessian_updates"] == 1
+    assert metrics["sophia/effective_lr"] == pytest.approx(1e-3)
+    assert metrics["sophia/curvature_mean"] == pytest.approx(0.25)
+    assert metrics["sophia/curvature_rms"] == pytest.approx((0.085) ** 0.5)
+    assert metrics["sophia/update_rms"] == 0.0
+    assert metrics["sophia/clipped_fraction"] == 0.0

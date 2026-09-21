@@ -17,6 +17,7 @@ from pathlib import Path
 from itertools import chain
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from nanochat.checkpoint_manager import save_checkpoint, load_model
@@ -72,7 +73,7 @@ def main():
     parser.add_argument('--sophia-lr', type=float, default=1e-4)
     parser.add_argument('--sophia-rho', type=float, default=0.04)
     parser.add_argument('--sophia-hessian-update-interval', type=int, default=10)
-    parser.add_argument('--sophia-batch-size', type=int, default=-1, help='sequences represented by a Sophia gradient; -1 uses --batch-size')
+    parser.add_argument('--sophia-batch-size', type=int, default=-1, help='tokens in the sampled-label Sophia curvature batch; -1 uses one global batch')
     parser.add_argument('--max-len', type=int, default=1024)
     parser.add_argument('--device', type=str, default='')
     parser.add_argument('--output-tag', type=str, default=None)
@@ -94,7 +95,7 @@ def main():
 
     # Optimizer like chat_rl uses. --lr below remains the common fine-tuning LR
     # override for every group, including any Sophia-assigned block.
-    sophia_batch_size = args.batch_size if args.sophia_batch_size == -1 else args.sophia_batch_size
+    sophia_batch_size = args.batch_size * (args.max_len - 1) * ddp_world_size if args.sophia_batch_size == -1 else args.sophia_batch_size
     if sophia_batch_size <= 0:
         raise ValueError('--sophia-batch-size must be positive or -1 for automatic resolution')
     optimizer = model.setup_optimizer(
@@ -126,6 +127,17 @@ def main():
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            optimizer.zero_grad()
+            if optimizer.should_update_sophia_hessian():
+                optimizer.set_sophia_batch_size(inputs.numel() * ddp_world_size)
+                curvature_logits = model(inputs)
+                sampled_targets = torch.distributions.Categorical(logits=curvature_logits).sample()
+                curvature_loss = F.cross_entropy(
+                    curvature_logits.flatten(0, 1), sampled_targets.flatten(), reduction='mean',
+                )
+                curvature_loss.backward()
+                optimizer.update_sophia_hessian()
+                optimizer.zero_grad()
             if master and step % 100 == 0:
                 print0(f"RAFT step {step} ep {ep} loss={float(loss.item()):.4f}")
                 # save checkpoint shard for safety

@@ -24,6 +24,7 @@ from contextlib import contextmanager
 import wandb
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
@@ -67,8 +68,8 @@ parser.add_argument("--matrix-optimizer", type=str, default="muon", choices=["mu
 parser.add_argument("--layer-optimizers", type=str, default="", help="per-block matrix optimizer layout: sophia-middle, or e.g. muon*4,sophia*12,adamw*4")
 parser.add_argument("--sophia-lr", type=float, default=1e-4, help="Sophia-G learning rate for Sophia-assigned blocks")
 parser.add_argument("--sophia-rho", type=float, default=0.04, help="Sophia-G clipping parameter rho")
-parser.add_argument("--sophia-hessian-update-interval", type=int, default=10, help="refresh Sophia's gradient-square curvature estimate every N optimizer steps")
-parser.add_argument("--sophia-batch-size", type=int, default=-1, help="sequences represented by a Sophia gradient; -1 derives total_batch_size / max_seq_len")
+parser.add_argument("--sophia-hessian-update-interval", type=int, default=10, help="refresh Sophia's sampled-label GNB curvature estimate every N optimizer steps")
+parser.add_argument("--sophia-batch-size", type=int, default=-1, help="tokens in the sampled-label Sophia curvature batch; -1 uses one global micro-batch")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
@@ -318,11 +319,13 @@ if weight_decay_scaled != args.weight_decay:
 
 sophia_batch_size = args.sophia_batch_size
 if sophia_batch_size == -1:
-    sophia_batch_size = max(1, total_batch_size // args.max_seq_len)
+    # Sophia-G's GNB estimate is produced by one additional sampled-label
+    # micro-batch, not by the gradient-accumulated training batch.
+    sophia_batch_size = max(1, args.device_batch_size * args.max_seq_len * ddp_world_size)
 if sophia_batch_size <= 0:
     raise ValueError("--sophia-batch-size must be positive or -1 for automatic resolution")
 if args.matrix_optimizer == "sophia" or args.layer_optimizers:
-    print0(f"Sophia-G batch size: {sophia_batch_size} sequences")
+    print0(f"Sophia-G sampled-label curvature batch: {sophia_batch_size:,} tokens")
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (Muon/AdamW/Sophia matrices, AdamW for embeddings/scalars)
@@ -392,6 +395,8 @@ if not use_dummy_wandb:
         "computed_total_batch_size": total_batch_size,
         "total_tokens": total_tokens,
         "ddp_world_size": ddp_world_size,
+        "sophia_curvature_estimator": "sampled_label_gnb",
+        "resolved_sophia_curvature_batch_tokens": sophia_batch_size,
     }, allow_val_change=True)
 
 # Learning rate schedule (linear warmup, constant, linear warmdown)
@@ -451,6 +456,7 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
 # Go!
+sophia_refreshes_since_log = 0
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
@@ -586,6 +592,30 @@ while True:
             grad_norm = compute_grad_norm(optimizer)
         optimizer.step()
     model.zero_grad(set_to_none=True)
+
+    # Sophia-G needs a separate Gauss-Newton-Bartlett estimate. Sampling labels
+    # from the current model and differentiating their NLL is the extra backward
+    # pass in the official implementation; reusing the task gradient here would
+    # be a different squared-gradient optimizer.
+    if optimizer.should_update_sophia_hessian():
+        curvature_logits = model(x)
+        sampled_targets = torch.distributions.Categorical(logits=curvature_logits).sample()
+        curvature_loss = F.cross_entropy(
+            curvature_logits.flatten(0, 1), sampled_targets.flatten(), reduction='mean',
+        )
+        if scaler is not None:
+            scaler.scale(curvature_loss).backward()
+            scaler.unscale_(optimizer)
+            optimizer.update_sophia_hessian()
+            # This is a separate scaled backward pass, so reset GradScaler's
+            # per-optimizer state before the next normal optimizer step.
+            scaler.update()
+        else:
+            curvature_loss.backward()
+            optimizer.update_sophia_hessian()
+        model.zero_grad(set_to_none=True)
+        sophia_refreshes_since_log += 1
+
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
@@ -642,7 +672,11 @@ while True:
         if device_type == "cuda":
             log_data["train/mem_alloc_gib"] = torch.cuda.memory_allocated() / 2**30
             log_data["train/mem_peak_gib"] = torch.cuda.max_memory_allocated() / 2**30
+        if optimizer.has_sophia():
+            log_data.update(optimizer.sophia_metrics())
+            log_data["sophia/hessian_refreshes_since_log"] = float(sophia_refreshes_since_log)
         wandb_run.log(log_data)
+        sophia_refreshes_since_log = 0
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)

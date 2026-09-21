@@ -16,6 +16,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import wandb
 import torch
+import torch.nn.functional as F
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
@@ -55,8 +56,8 @@ parser.add_argument("--matrix-optimizer", type=str, default=None, choices=["muon
 parser.add_argument("--layer-optimizers", type=str, default=None, help="per-block matrix optimizer layout: sophia-middle, or e.g. muon*4,sophia*12,adamw*4 (default: inherit from pretrain)")
 parser.add_argument("--sophia-lr", type=float, default=None, help="Sophia-G learning rate (default: inherit from pretrain)")
 parser.add_argument("--sophia-rho", type=float, default=None, help="Sophia-G clipping parameter rho (default: inherit from pretrain)")
-parser.add_argument("--sophia-hessian-update-interval", type=int, default=None, help="refresh Sophia curvature every N steps (default: inherit from pretrain)")
-parser.add_argument("--sophia-batch-size", type=int, default=-1, help="sequences represented by a Sophia gradient; -1 derives total_batch_size / max_seq_len")
+parser.add_argument("--sophia-hessian-update-interval", type=int, default=None, help="refresh Sophia sampled-label GNB curvature every N steps (default: inherit from pretrain)")
+parser.add_argument("--sophia-batch-size", type=int, default=-1, help="tokens in the sampled-label Sophia curvature batch; -1 uses one global micro-batch")
 parser.add_argument("--init-lr-frac", type=float, default=0.8, help="initial LR as fraction of base LR")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
@@ -147,11 +148,16 @@ token_bytes = get_token_bytes(device=device)
 
 sophia_batch_size = args.sophia_batch_size
 if sophia_batch_size == -1:
-    sophia_batch_size = max(1, args.total_batch_size // args.max_seq_len)
+    sophia_batch_size = max(1, world_tokens_per_fwdbwd)
 if sophia_batch_size <= 0:
     raise ValueError("--sophia-batch-size must be positive or -1 for automatic resolution")
 if args.matrix_optimizer == "sophia" or args.layer_optimizers:
-    print0(f"Sophia-G batch size: {sophia_batch_size} sequences")
+    print0(f"Sophia-G sampled-label curvature batch: {sophia_batch_size:,} tokens")
+if not use_dummy_wandb:
+    wandb_run.config.update({
+        "sophia_curvature_estimator": "sampled_label_gnb",
+        "resolved_sophia_curvature_batch_tokens": sophia_batch_size,
+    }, allow_val_change=True)
 
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 # Note that pretraining ramps weight_decay to zero by end of pretraining, so SFT continues with zero
@@ -527,6 +533,23 @@ while True:
             grad_norm = compute_grad_norm(optimizer)
         optimizer.step()
     model.zero_grad(set_to_none=True)
+    sophia_hessian_refreshed = False
+    if optimizer.should_update_sophia_hessian():
+        curvature_logits = model(x)
+        sampled_targets = torch.distributions.Categorical(logits=curvature_logits).sample()
+        curvature_loss = F.cross_entropy(
+            curvature_logits.flatten(0, 1), sampled_targets.flatten(), reduction="mean",
+        )
+        if scaler is not None:
+            scaler.scale(curvature_loss).backward()
+            scaler.unscale_(optimizer)
+            optimizer.update_sophia_hessian()
+            scaler.update()
+        else:
+            curvature_loss.backward()
+            optimizer.update_sophia_hessian()
+        model.zero_grad(set_to_none=True)
+        sophia_hessian_refreshed = True
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -569,6 +592,9 @@ while True:
         if device_type == "cuda":
             log_data["train/mem_alloc_gib"] = torch.cuda.memory_allocated() / 2**30
             log_data["train/mem_peak_gib"] = torch.cuda.max_memory_allocated() / 2**30
+        if optimizer.has_sophia():
+            log_data.update(optimizer.sophia_metrics())
+            log_data["sophia/hessian_refreshed"] = float(sophia_hessian_refreshed)
         wandb_run.log(log_data)
 
     # The garbage collector spends ~500ms scanning for cycles quite frequently.
